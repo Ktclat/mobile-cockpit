@@ -3,9 +3,10 @@ package dev.cockpit.runtime
 @JvmInline
 value class DispatcherLane(val value: String)
 
-@JvmInline
-value class DispatcherIdentity(val value: String)
+fun interface RuntimeDispatcher {
+    fun dispatch(block: () -> Unit)
+}
 
 interface DispatcherProvider {
-    fun dispatcherFor(lane: DispatcherLane): DispatcherIdentity
+    fun dispatcherFor(lane: DispatcherLane): RuntimeDispatcher
 }
