@@ -7,6 +7,9 @@ kotlin {
 }
 
 dependencies {
+    testImplementation(project(":core:domain"))
+    testImplementation(project(":core:runtime-api"))
+    testImplementation(project(":test-support"))
     testImplementation(platform(libs.compose.bom))
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly(libs.junit.platform.launcher)
