@@ -39,6 +39,25 @@ class ImmutableBytesTest {
     }
 
     @Test
+    fun allAccessibleByteArrayCreationPathsDefensivelyCopyAndKeepContentStable() {
+        val creators = byteArrayCreators()
+
+        assertTrue(creators.isNotEmpty())
+        creators.forEach { create ->
+            val input = byteArrayOf(1, 2, 3)
+            val immutable = create(input)
+            val expected = ImmutableBytes.copyOf(input)
+            val initialHashCode = immutable.hashCode()
+
+            input[0] = 9
+
+            assertArrayEquals(byteArrayOf(1, 2, 3), immutable.toByteArray())
+            assertEquals(expected, immutable)
+            assertEquals(initialHashCode, immutable.hashCode())
+        }
+    }
+
+    @Test
     fun usesContentEqualityAndHashCode() {
         val first = ImmutableBytes.copyOf(byteArrayOf(1, 2))
         val equal = ImmutableBytes.copyOf(byteArrayOf(1, 2))
@@ -60,20 +79,31 @@ class ImmutableBytesTest {
     @Test
     fun hasNoPublicMutableBackingFieldOrPlatformApi() {
         val type = ImmutableBytes::class.java
-        val forbiddenApiPrefixes = listOf("android.", "java.io.", "java.nio.", "java.util.", "kotlinx.")
+        val companionType = type.getField("Companion").type
+        val forbiddenApiPrefixes = listOf(
+            "android.",
+            "java.io.",
+            "java.nio.",
+            "java.util.",
+            "kotlin.sequences.",
+            "kotlinx.",
+        )
+        val forbiddenApiTypes = setOf("java.lang.Iterable", "kotlin.jvm.internal.DefaultConstructorMarker")
+        fun isForbiddenApiType(type: Class<*>): Boolean =
+            type.name in forbiddenApiTypes || forbiddenApiPrefixes.any(type.name::startsWith)
 
         assertTrue(
             type.declaredFields.none { field ->
                 Modifier.isPublic(field.modifiers) && field.type == ByteArray::class.java
             },
         )
-        assertFalse(type.declaredMethods.any { method ->
+        assertFalse(type.constructors.any { constructor ->
+            constructor.parameterTypes.any(::isForbiddenApiType)
+        })
+        assertFalse((type.declaredMethods + companionType.declaredMethods).any { method ->
             Modifier.isPublic(method.modifiers) &&
                 method.name != "toByteArray" &&
-                (forbiddenApiPrefixes.any(method.returnType.name::startsWith) ||
-                    method.parameterTypes.any { parameter ->
-                        forbiddenApiPrefixes.any(parameter.name::startsWith)
-                    })
+                (isForbiddenApiType(method.returnType) || method.parameterTypes.any(::isForbiddenApiType))
         })
     }
 
@@ -95,5 +125,32 @@ class ImmutableBytesTest {
         assertEquals("plan", VerificationPlanId("plan").value)
         assertEquals("criterion", VerificationCriterionId("criterion").value)
         assertEquals("credential", CredentialReference("credential").value)
+    }
+
+    private fun byteArrayCreators(): List<(ByteArray) -> ImmutableBytes> {
+        val type = ImmutableBytes::class.java
+        val constructorCreators = type.constructors
+            .filter { constructor -> constructor.parameterTypes.any { it == ByteArray::class.java } }
+            .map { constructor ->
+                { input: ByteArray ->
+                    val arguments = constructor.parameterTypes.map { parameter ->
+                        if (parameter == ByteArray::class.java) input else null
+                    }.toTypedArray()
+                    constructor.newInstance(*arguments) as ImmutableBytes
+                }
+            }
+        val companionCreators = ImmutableBytes.Companion.javaClass.declaredMethods
+            .filter { method ->
+                Modifier.isPublic(method.modifiers) &&
+                    method.returnType == ImmutableBytes::class.java &&
+                    method.parameterTypes.contentEquals(arrayOf(ByteArray::class.java))
+            }
+            .map { method ->
+                { input: ByteArray ->
+                    method.invoke(ImmutableBytes.Companion, *arrayOf(input)) as ImmutableBytes
+                }
+            }
+
+        return constructorCreators + companionCreators
     }
 }

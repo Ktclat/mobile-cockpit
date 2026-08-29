@@ -1,6 +1,8 @@
 package dev.cockpit.domain.bytes
 
-class ImmutableBytes private constructor(private val bytes: ByteArray) {
+class ImmutableBytes(bytes: ByteArray) {
+    private val bytes: ByteArray = bytes.copyOf()
+
     val size: Int
         get() = bytes.size
 
@@ -14,6 +16,6 @@ class ImmutableBytes private constructor(private val bytes: ByteArray) {
     override fun toString(): String = "ImmutableBytes(size=$size)"
 
     companion object {
-        fun copyOf(bytes: ByteArray): ImmutableBytes = ImmutableBytes(bytes.copyOf())
+        fun copyOf(bytes: ByteArray): ImmutableBytes = ImmutableBytes(bytes)
     }
 }
