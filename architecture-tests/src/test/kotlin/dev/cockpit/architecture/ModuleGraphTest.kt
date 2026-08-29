@@ -36,6 +36,10 @@ class ModuleGraphTest {
             graph.productionEdges.all { it in graph.allowedEdges },
             "Every actual production project dependency must be declared in the allowed-edge manifest.",
         )
+        assertTrue(
+            graph.nonTestStructuralEdges.isEmpty(),
+            "The root and structural container projects must not declare non-test project dependencies: ${graph.nonTestStructuralEdges}",
+        )
         assertFalse(
             graph.productionEdges.any { (_, target) -> target.startsWith(":spikes:") },
             "Production modules must not depend on spike projects.",
@@ -82,6 +86,13 @@ class ModuleGraphTest {
         }
     }
 
+    @Test
+    fun rejectsNonTestProjectDependencyFromStructuralContainer() {
+        assertGraphRejects(projectRoot().resolve("build.gradle.kts")) {
+            "$it\n\nproject(\":core\") {\n    val architectureGraph = configurations.maybeCreate(\"architectureGraph\")\n    dependencies.add(\n        architectureGraph.name,\n        dependencies.project(mapOf(\"path\" to \":spikes:ssh-transport\")),\n    )\n}\n"
+        }
+    }
+
     private fun projectRoot(): Path =
         generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath()) { it.parent }
             .first { it.resolve(".git").exists() }
@@ -108,6 +119,7 @@ class ModuleGraphTest {
         val declaredProjects: Set<String>,
         val allowedEdges: Set<Edge>,
         val productionEdges: Set<Edge>,
+        val nonTestStructuralEdges: Set<Edge>,
     ) {
         fun reachableFrom(source: String): Set<String> {
             val visited = mutableSetOf<String>()
@@ -134,7 +146,16 @@ class ModuleGraphTest {
                     .filter { it.source in productionProjects && !it.configuration.contains("test", ignoreCase = true) }
                     .map { Edge(it.source, it.target) }
                     .toSet()
-                return GradleModuleGraph(evaluatedModel.projects - structuralProjectPaths, manifest, productionEdges)
+                val nonTestStructuralEdges = evaluatedModel.dependencies
+                    .filter { it.source in structuralProjectPaths && !it.configuration.contains("test", ignoreCase = true) }
+                    .map { Edge(it.source, it.target) }
+                    .toSet()
+                return GradleModuleGraph(
+                    evaluatedModel.projects - structuralProjectPaths,
+                    manifest,
+                    productionEdges,
+                    nonTestStructuralEdges,
+                )
             }
 
             private fun readEvaluatedModel(root: Path): EvaluatedModel {

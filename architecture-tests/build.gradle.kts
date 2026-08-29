@@ -14,6 +14,7 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    outputs.upToDateWhen { false }
     inputs.files(
         rootProject.file("gradle/libs.versions.toml"),
         rootProject.file("gradle/verification-metadata.xml"),
