@@ -84,8 +84,12 @@ class InjectedSourcePolicyTest {
                 """
                 package dev.cockpit.domain
                 import dev.cockpit.domain.time.AppClock
+                import java.time.Clock
+                import java.time.Duration
                 // System.currentTimeMillis() belongs in an adapter, not here.
                 fun currentTimeMillisFromClock(clock: AppClock) = clock.now()
+                fun tickInjectedClock(clock: Clock) = Clock.tick(clock, Duration.ofSeconds(1))
+                fun sampleInjectedEntropy(injectedEntropy: EntropyPort) = injectedEntropy.nextInt()
                 val diagnostic = "UUID.randomUUID()"
                 """.trimIndent(),
             )
@@ -111,13 +115,9 @@ class InjectedSourcePolicyTest {
             "domain/KotlinAliases.kt",
             """
             package dev.cockpit.domain
-            import java.time.Clock as WallClock
-            import java.time.Clock.systemUTC
             import java.util.UUID.randomUUID as freshId
             import kotlin.random.Random as SourceRandom
             import kotlinx.coroutines.Dispatchers as RuntimeDispatchers
-            val clock = WallClock.systemDefaultZone()
-            val inheritedClock = systemUTC()
             val id = freshId()
             val entropy = SourceRandom.Default.nextInt()
             val dispatcher = RuntimeDispatchers.IO
@@ -127,12 +127,268 @@ class InjectedSourcePolicyTest {
         assertPolicyRejects(
             fixtureRoot,
             "KotlinAliases.kt",
-            "Clock.system*",
             "UUID.randomUUID",
             "kotlin.random.Random",
             "Dispatchers property",
         )
     }
+
+    @Test
+    fun sourcePolicyRejectsAliasedClockSystemDefaultZone() = assertRejectedFixture(
+        "domain/AliasedClock.kt",
+        """
+        package dev.cockpit.domain
+        import java.time.Clock as WallClock
+        val clock = WallClock.systemDefaultZone()
+        """.trimIndent(),
+        "Clock.system*",
+    )
+
+    @Test
+    fun sourcePolicyRejectsMemberImportedClockSystemUtc() = assertRejectedFixture(
+        "domain/MemberImportedClock.kt",
+        """
+        package dev.cockpit.domain
+        import java.time.Clock.systemUTC
+        val clock = systemUTC()
+        """.trimIndent(),
+        "Clock.system*",
+    )
+
+    @Test
+    fun sourcePolicyRejectsKotlinRandomDirectImportedAliasMemberAndWildcardForms() {
+        assertRejectedFixture(
+            "domain/DirectKotlinRandom.kt",
+            """
+            package dev.cockpit.domain
+            val boolean = kotlin.random.Random.nextBoolean()
+            val bytes = kotlin.random.Random.nextBytes(4)
+            val double = kotlin.random.Random.nextDouble()
+            val float = kotlin.random.Random.nextFloat()
+            val int = kotlin.random.Random.nextInt()
+            val long = kotlin.random.Random.nextLong()
+            val seeded = kotlin.random.Random(7)
+            val default = kotlin.random.Random.Default
+            """.trimIndent(),
+            "Random.next*",
+            "Random factory",
+            "Random.Default",
+        )
+        assertRejectedFixture(
+            "domain/ImportedKotlinRandom.kt",
+            """
+            package dev.cockpit.domain
+            import kotlin.random.Random
+            val random = Random.nextInt()
+            """.trimIndent(),
+            "Random.next*",
+        )
+        assertRejectedFixture(
+            "domain/AliasedKotlinRandom.kt",
+            """
+            package dev.cockpit.domain
+            import kotlin.random.Random as Entropy
+            val random = Entropy.nextLong()
+            """.trimIndent(),
+            "Random.next*",
+        )
+        assertRejectedFixture(
+            "domain/MemberImportedKotlinRandom.kt",
+            """
+            package dev.cockpit.domain
+            import kotlin.random.Random.nextDouble
+            val random = nextDouble()
+            """.trimIndent(),
+            "Random.next*",
+        )
+        assertRejectedFixture(
+            "domain/WildcardKotlinRandom.kt",
+            """
+            package dev.cockpit.domain
+            import kotlin.random.*
+            val random = Random.nextFloat()
+            """.trimIndent(),
+            "Random.next*",
+        )
+    }
+
+    @Test
+    fun sourcePolicyRejectsMathAndStrictMathRandomCalls() {
+        assertRejectedFixture(
+            "runtime/MathRandom.java",
+            """
+            package dev.cockpit.runtime;
+            class MathRandom { double random = Math.random(); }
+            """.trimIndent(),
+            "Math.random",
+        )
+        assertRejectedFixture(
+            "runtime/StrictMathRandom.java",
+            """
+            package dev.cockpit.runtime;
+            import static java.lang.StrictMath.random;
+            class StrictMathRandom { double randomValue = random(); }
+            """.trimIndent(),
+            "StrictMath.random",
+        )
+    }
+
+    @Test
+    fun sourcePolicyRejectsEachRemainingJavaTimeNowFamily() {
+        listOf(
+            "LocalDate" to "java.time.LocalDate.now()",
+            "LocalTime" to "java.time.LocalTime.now()",
+            "OffsetTime" to "java.time.OffsetTime.now()",
+            "Year" to "java.time.Year.now()",
+            "YearMonth" to "java.time.YearMonth.now()",
+            "MonthDay" to "java.time.MonthDay.now()",
+        ).forEach { (type, expression) ->
+            assertRejectedFixture(
+                "runtime/${type}Now.java",
+                """
+                package dev.cockpit.runtime;
+                class ${type}Now { Object value = $expression; }
+                """.trimIndent(),
+                "$type.now",
+            )
+        }
+    }
+
+    @Test
+    fun sourcePolicyRejectsSystemBackedClockTickAcrossImportForms() {
+        assertRejectedFixture(
+            "runtime/QualifiedClockTick.java",
+            """
+            package dev.cockpit.runtime;
+            class QualifiedClockTick {
+                Object tick = java.time.Clock.tick(java.time.Clock.systemUTC(), java.time.Duration.ofSeconds(1));
+            }
+            """.trimIndent(),
+            "Clock.tick(system-backed Clock)",
+        )
+        assertRejectedFixture(
+            "runtime/ImportedClockTick.java",
+            """
+            package dev.cockpit.runtime;
+            import java.time.Clock;
+            class ImportedClockTick {
+                Object tick = Clock.tick(Clock.systemDefaultZone(), java.time.Duration.ofSeconds(1));
+            }
+            """.trimIndent(),
+            "Clock.tick(system-backed Clock)",
+        )
+        assertRejectedFixture(
+            "domain/AliasedClockTick.kt",
+            """
+            package dev.cockpit.domain
+            import java.time.Clock as RuntimeClock
+            val tick = RuntimeClock.tick(RuntimeClock.systemUTC(), java.time.Duration.ofSeconds(1))
+            """.trimIndent(),
+            "Clock.tick(system-backed Clock)",
+        )
+        assertRejectedFixture(
+            "domain/MemberImportedClockTick.kt",
+            """
+            package dev.cockpit.domain
+            import java.time.Clock.tick
+            import java.time.Clock.systemUTC
+            val clock = tick(systemUTC(), java.time.Duration.ofSeconds(1))
+            """.trimIndent(),
+            "Clock.tick(system-backed Clock)",
+        )
+        assertRejectedFixture(
+            "runtime/StaticClockTick.java",
+            """
+            package dev.cockpit.runtime;
+            import static java.time.Clock.tick;
+            import static java.time.Clock.systemUTC;
+            class StaticClockTick {
+                Object value = tick(systemUTC(), java.time.Duration.ofSeconds(1));
+            }
+            """.trimIndent(),
+            "Clock.tick(system-backed Clock)",
+        )
+        assertRejectedFixture(
+            "runtime/WildcardClockTick.java",
+            """
+            package dev.cockpit.runtime;
+            import java.time.*;
+            class WildcardClockTick {
+                Object value = Clock.tick(Clock.systemUTC(), Duration.ofSeconds(1));
+            }
+            """.trimIndent(),
+            "Clock.tick(system-backed Clock)",
+        )
+    }
+
+    @Test
+    fun sourcePolicyRejectsSecureRandomFactoriesAcrossImportForms() {
+        assertRejectedFixture(
+            "runtime/QualifiedSecureRandom.java",
+            """
+            package dev.cockpit.runtime;
+            class QualifiedSecureRandom {
+                Object instance = java.security.SecureRandom.getInstance("SHA1PRNG");
+                Object strong = java.security.SecureRandom.getInstanceStrong();
+                byte[] seed = java.security.SecureRandom.getSeed(8);
+            }
+            """.trimIndent(),
+            "SecureRandom factory",
+        )
+        assertRejectedFixture(
+            "runtime/ImportedSecureRandom.java",
+            """
+            package dev.cockpit.runtime;
+            import java.security.SecureRandom;
+            class ImportedSecureRandom { Object instance = SecureRandom.getInstanceStrong(); }
+            """.trimIndent(),
+            "SecureRandom factory",
+        )
+        assertRejectedFixture(
+            "domain/AliasedSecureRandom.kt",
+            """
+            package dev.cockpit.domain
+            import java.security.SecureRandom as SecureEntropy
+            val seed = SecureEntropy.getSeed(8)
+            """.trimIndent(),
+            "SecureRandom factory",
+        )
+        assertRejectedFixture(
+            "domain/MemberImportedSecureRandom.kt",
+            """
+            package dev.cockpit.domain
+            import java.security.SecureRandom.getInstance
+            val instance = getInstance("SHA1PRNG")
+            """.trimIndent(),
+            "SecureRandom factory",
+        )
+        assertRejectedFixture(
+            "runtime/StaticWildcardSecureRandom.java",
+            """
+            package dev.cockpit.runtime;
+            import static java.security.SecureRandom.*;
+            class StaticWildcardSecureRandom { Object instance = getInstanceStrong(); }
+            """.trimIndent(),
+            "SecureRandom factory",
+        )
+    }
+
+    @Test
+    fun sourcePolicyRejectsJava17RandomFactories() = assertRejectedFixture(
+        "runtime/Java17RandomFactories.java",
+        """
+        package dev.cockpit.runtime;
+        class Java17RandomFactories {
+            Object split = new java.util.SplittableRandom();
+            Object generator = java.util.random.RandomGenerator.getDefault();
+            Object namedGenerator = java.util.random.RandomGenerator.of("L64X128MixRandom");
+            Object factory = java.util.random.RandomGeneratorFactory.of("L64X128MixRandom");
+        }
+        """.trimIndent(),
+        "SplittableRandom constructor",
+        "RandomGenerator factory",
+        "RandomGeneratorFactory factory",
+    )
 
     @Test
     fun sourcePolicyRejectsJavaStaticWildcardAndGetterImports() = withFixtureRoot { fixtureRoot ->
@@ -285,6 +541,13 @@ class InjectedSourcePolicyTest {
         }
     }
 
+    private fun assertRejectedFixture(relativePath: String, source: String, vararg expectedRules: String) {
+        withFixtureRoot { fixtureRoot ->
+            writeFixture(fixtureRoot, relativePath, source)
+            assertPolicyRejects(fixtureRoot, relativePath.substringAfterLast('/'), *expectedRules)
+        }
+    }
+
     private fun assertPolicyRejects(fixtureRoot: Path, expectedFileName: String, vararg expectedRules: String) {
         val violation = assertThrows(AssertionError::class.java) {
             SourcePolicy.assertCompliant(listOf(fixtureRoot))
@@ -299,8 +562,10 @@ class InjectedSourcePolicyTest {
     private object SourcePolicy {
         private const val supportedInventory =
             "System.currentTimeMillis/nanoTime; java.time Instant/LocalDateTime/OffsetDateTime/ZonedDateTime.now; " +
-                "Clock.system*, UUID.randomUUID, kotlin.random.Random.Default, java.util.Random, SecureRandom, " +
-                "ThreadLocalRandom.current, Dispatchers.Default/IO/Main/Unconfined and Java getters, GlobalScope"
+                "LocalDate/LocalTime/OffsetTime/Year/YearMonth/MonthDay.now; Clock.system* and tick(system-backed Clock); " +
+                "UUID.randomUUID, kotlin.random.Random.Default/next*/factory, Math.random, StrictMath.random, java.util.Random, " +
+                "SecureRandom constructor/factories, ThreadLocalRandom.current, SplittableRandom constructor, RandomGenerator factories, " +
+                "Dispatchers.Default/IO/Main/Unconfined and Java getters, GlobalScope"
 
         fun assertCompliant(sourceRoots: List<Path>) {
             val violations = sourceRoots.flatMap { sourceRoot ->
@@ -338,7 +603,7 @@ class InjectedSourcePolicyTest {
             val localName: String get() = alias ?: target.substringAfterLast('.')
         }
 
-        private enum class Usage { MEMBER_CALL, MEMBER_PROPERTY, CONSTRUCTOR, TYPE_REFERENCE }
+        private enum class Usage { MEMBER_CALL, MEMBER_PROPERTY, CONSTRUCTOR, TYPE_REFERENCE, SYSTEM_BACKED_TICK }
 
         private data class ForbiddenRule(
             val description: String,
@@ -359,6 +624,7 @@ class InjectedSourcePolicyTest {
                 Usage.TYPE_REFERENCE -> typeNames(imports).any { name ->
                     Regex("\\b${Regex.escape(name)}\\b").containsMatchIn(source)
                 } || Regex("\\b${dotted(owner)}\\b").containsMatchIn(source)
+                Usage.SYSTEM_BACKED_TICK -> systemBackedTickMatches(source, imports)
             }
 
             private fun memberMatches(
@@ -383,6 +649,25 @@ class InjectedSourcePolicyTest {
             private fun constructorMatches(source: String, imports: List<ImportedName>): Boolean =
                 typeNames(imports).any { name -> callableNameMatches(source, name) } ||
                     callableNameMatches(source, dotted(owner), isPattern = true)
+
+            private fun systemBackedTickMatches(source: String, imports: List<ImportedName>): Boolean {
+                val tickPrefixes = memberPrefixes(imports, "tick")
+                val systemPrefixes = setOf("system", "systemUTC", "systemDefaultZone")
+                    .flatMap { memberPrefixes(imports, it) }
+                return tickPrefixes.any { tickPrefix ->
+                    systemPrefixes.any { systemPrefix ->
+                        Regex("\\b$tickPrefix\\s*\\(\\s*$systemPrefix\\s*\\(").containsMatchIn(source)
+                    }
+                }
+            }
+
+            private fun memberPrefixes(imports: List<ImportedName>, member: String): Set<String> = buildSet {
+                add("${dotted(owner)}\\s*\\.\\s*${Regex.escape(member)}")
+                typeNames(imports).forEach { name ->
+                    add("${Regex.escape(name)}\\s*\\.\\s*${Regex.escape(member)}")
+                }
+                directMemberNames(imports, member).forEach { name -> add(Regex.escape(name)) }
+            }
 
             private fun callableNameMatches(source: String, name: String, isPattern: Boolean = false): Boolean {
                 val namePattern = if (isPattern) name else Regex.escape(name)
@@ -415,7 +700,12 @@ class InjectedSourcePolicyTest {
             "^\\s*import\\s+(?:static\\s+)?([A-Za-z_$][\\w$]*(?:\\s*\\.\\s*(?:[A-Za-z_$][\\w$]*|\\*))*)(?:\\s+as\\s+([A-Za-z_]\\w*))?\\s*;?\\s*$",
             RegexOption.MULTILINE,
         )
-        private val implicitlyAvailableTypes = setOf("java.lang.System", "kotlin.random.Random")
+        private val implicitlyAvailableTypes = setOf(
+            "java.lang.System",
+            "java.lang.Math",
+            "java.lang.StrictMath",
+            "kotlin.random.Random",
+        )
         private val forbiddenRules = listOf(
             ForbiddenRule("direct java.lang.System.currentTimeMillis()", "java.lang.System", setOf("currentTimeMillis"), Usage.MEMBER_CALL),
             ForbiddenRule("direct java.lang.System.nanoTime()", "java.lang.System", setOf("nanoTime"), Usage.MEMBER_CALL),
@@ -423,12 +713,27 @@ class InjectedSourcePolicyTest {
             ForbiddenRule("direct java.time.LocalDateTime.now()", "java.time.LocalDateTime", setOf("now"), Usage.MEMBER_CALL),
             ForbiddenRule("direct java.time.OffsetDateTime.now()", "java.time.OffsetDateTime", setOf("now"), Usage.MEMBER_CALL),
             ForbiddenRule("direct java.time.ZonedDateTime.now()", "java.time.ZonedDateTime", setOf("now"), Usage.MEMBER_CALL),
+            ForbiddenRule("direct java.time.LocalDate.now()", "java.time.LocalDate", setOf("now"), Usage.MEMBER_CALL),
+            ForbiddenRule("direct java.time.LocalTime.now()", "java.time.LocalTime", setOf("now"), Usage.MEMBER_CALL),
+            ForbiddenRule("direct java.time.OffsetTime.now()", "java.time.OffsetTime", setOf("now"), Usage.MEMBER_CALL),
+            ForbiddenRule("direct java.time.Year.now()", "java.time.Year", setOf("now"), Usage.MEMBER_CALL),
+            ForbiddenRule("direct java.time.YearMonth.now()", "java.time.YearMonth", setOf("now"), Usage.MEMBER_CALL),
+            ForbiddenRule("direct java.time.MonthDay.now()", "java.time.MonthDay", setOf("now"), Usage.MEMBER_CALL),
             ForbiddenRule("direct java.time.Clock.system*()", "java.time.Clock", setOf("system", "systemUTC", "systemDefaultZone"), Usage.MEMBER_CALL),
+            ForbiddenRule("direct java.time.Clock.tick(system-backed Clock)", "java.time.Clock", usage = Usage.SYSTEM_BACKED_TICK),
             ForbiddenRule("direct java.util.UUID.randomUUID()", "java.util.UUID", setOf("randomUUID"), Usage.MEMBER_CALL),
             ForbiddenRule("direct kotlin.random.Random.Default", "kotlin.random.Random", setOf("Default"), Usage.MEMBER_PROPERTY),
+            ForbiddenRule("direct kotlin.random.Random.next*()", "kotlin.random.Random", setOf("nextBoolean", "nextBytes", "nextDouble", "nextFloat", "nextInt", "nextLong"), Usage.MEMBER_CALL),
+            ForbiddenRule("direct kotlin.random.Random factory", "kotlin.random.Random", usage = Usage.CONSTRUCTOR),
+            ForbiddenRule("direct java.lang.Math.random()", "java.lang.Math", setOf("random"), Usage.MEMBER_CALL),
+            ForbiddenRule("direct java.lang.StrictMath.random()", "java.lang.StrictMath", setOf("random"), Usage.MEMBER_CALL),
             ForbiddenRule("direct java.util.Random constructor", "java.util.Random", usage = Usage.CONSTRUCTOR),
             ForbiddenRule("direct java.security.SecureRandom constructor", "java.security.SecureRandom", usage = Usage.CONSTRUCTOR),
+            ForbiddenRule("direct java.security.SecureRandom factory", "java.security.SecureRandom", setOf("getInstance", "getInstanceStrong", "getSeed"), Usage.MEMBER_CALL),
             ForbiddenRule("direct java.util.concurrent.ThreadLocalRandom.current()", "java.util.concurrent.ThreadLocalRandom", setOf("current"), Usage.MEMBER_CALL),
+            ForbiddenRule("direct java.util.SplittableRandom constructor", "java.util.SplittableRandom", usage = Usage.CONSTRUCTOR),
+            ForbiddenRule("direct java.util.random.RandomGenerator factory", "java.util.random.RandomGenerator", setOf("getDefault", "of"), Usage.MEMBER_CALL),
+            ForbiddenRule("direct java.util.random.RandomGeneratorFactory factory", "java.util.random.RandomGeneratorFactory", setOf("getDefault", "of"), Usage.MEMBER_CALL),
             ForbiddenRule("direct kotlinx.coroutines.Dispatchers property", "kotlinx.coroutines.Dispatchers", setOf("Default", "IO", "Main", "Unconfined"), Usage.MEMBER_PROPERTY),
             ForbiddenRule("direct kotlinx.coroutines.Dispatchers getter", "kotlinx.coroutines.Dispatchers", setOf("getDefault", "getIO", "getMain", "getUnconfined"), Usage.MEMBER_CALL),
             ForbiddenRule("direct kotlinx.coroutines.GlobalScope", "kotlinx.coroutines.GlobalScope", usage = Usage.TYPE_REFERENCE),
