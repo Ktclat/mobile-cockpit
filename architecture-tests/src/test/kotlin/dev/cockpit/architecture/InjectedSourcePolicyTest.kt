@@ -87,13 +87,11 @@ class InjectedSourcePolicyTest {
                 import java.time.Clock
                 import java.time.Duration
                 import java.util.Date
-                import java.util.GregorianCalendar
                 // System.currentTimeMillis() belongs in an adapter, not here.
                 fun currentTimeMillisFromClock(clock: AppClock) = clock.now()
                 fun tickInjectedClock(clock: Clock) = Clock.tick(clock, Duration.ofSeconds(1))
                 fun sampleInjectedEntropy(injectedEntropy: EntropyPort) = injectedEntropy.nextInt()
                 fun dateAt(injectedEpochMillis: Long) = Date(injectedEpochMillis)
-                fun calendarFor(injectedZone: java.util.TimeZone) = GregorianCalendar(injectedZone)
                 val diagnostic = "UUID.randomUUID()"
                 """.trimIndent(),
             )
@@ -546,7 +544,51 @@ class InjectedSourcePolicyTest {
             package dev.cockpit.runtime;
             class NewGregorianCalendar { Object value = new java.util.GregorianCalendar(); }
             """.trimIndent(),
-            "GregorianCalendar no-arg constructor",
+            "GregorianCalendar constructor",
+        )
+    }
+
+    @Test
+    fun sourcePolicyRejectsEveryGregorianCalendarConstructorIndependently() {
+        assertRejectedFixture(
+            "runtime/GregorianCalendarTimeZone.java",
+            """
+            package dev.cockpit.runtime;
+            class GregorianCalendarTimeZone {
+                Object value = new java.util.GregorianCalendar(java.util.TimeZone.getDefault());
+            }
+            """.trimIndent(),
+            "GregorianCalendar constructor",
+        )
+        assertRejectedFixture(
+            "runtime/GregorianCalendarLocale.java",
+            """
+            package dev.cockpit.runtime;
+            import java.util.GregorianCalendar;
+            import java.util.Locale;
+            class GregorianCalendarLocale { Object value = new GregorianCalendar(Locale.CANADA); }
+            """.trimIndent(),
+            "GregorianCalendar constructor",
+        )
+        assertRejectedFixture(
+            "domain/AliasedGregorianCalendar.kt",
+            """
+            package dev.cockpit.domain
+            import java.util.GregorianCalendar as WallCalendar
+            import java.util.Locale
+            import java.util.TimeZone
+            val value = WallCalendar(TimeZone.getDefault(), Locale.CANADA)
+            """.trimIndent(),
+            "GregorianCalendar constructor",
+        )
+        assertRejectedFixture(
+            "domain/KotlinGregorianCalendarDate.kt",
+            """
+            package dev.cockpit.domain
+            import java.util.GregorianCalendar
+            val value = GregorianCalendar(2026, 7, 30)
+            """.trimIndent(),
+            "GregorianCalendar constructor",
         )
     }
 
@@ -761,7 +803,7 @@ class InjectedSourcePolicyTest {
     private object SourcePolicy {
         private const val supportedInventory =
             "System.currentTimeMillis/nanoTime; java.time Instant/LocalDateTime/OffsetDateTime/ZonedDateTime.now; " +
-                "LocalDate/LocalTime/OffsetTime/Year/YearMonth/MonthDay.now; Date()/Calendar.getInstance()/GregorianCalendar(); " +
+                "LocalDate/LocalTime/OffsetTime/Year/YearMonth/MonthDay.now; Date()/Calendar.getInstance()/all GregorianCalendar constructors; " +
                 "Clock.system/systemUTC/systemDefaultZone and tick(system-backed Clock); kotlin.time.Clock.System.now(); " +
                 "UUID.randomUUID, kotlin.random.Random.Default/nextBoolean/nextBytes/nextDouble/nextFloat/nextInt/nextLong/factory, " +
                 "Math.random, StrictMath.random, java.util.Random, SecureRandom constructor/getInstance/getInstanceStrong/getSeed, " +
@@ -959,7 +1001,7 @@ class InjectedSourcePolicyTest {
             ForbiddenRule("direct java.time.Clock.tick(system-backed Clock)", "java.time.Clock", usage = Usage.SYSTEM_BACKED_TICK),
             ForbiddenRule("direct java.util.Date no-arg constructor", "java.util.Date", usage = Usage.NO_ARGUMENT_CONSTRUCTOR),
             ForbiddenRule("direct java.util.Calendar.getInstance()", "java.util.Calendar", setOf("getInstance"), Usage.MEMBER_CALL),
-            ForbiddenRule("direct java.util.GregorianCalendar no-arg constructor", "java.util.GregorianCalendar", usage = Usage.NO_ARGUMENT_CONSTRUCTOR),
+            ForbiddenRule("direct java.util.GregorianCalendar constructor", "java.util.GregorianCalendar", usage = Usage.CONSTRUCTOR),
             ForbiddenRule("direct kotlin.time.Clock.System.now()", "kotlin.time.Clock", usage = Usage.KOTLIN_CLOCK_SYSTEM_NOW),
             ForbiddenRule("direct java.util.UUID.randomUUID()", "java.util.UUID", setOf("randomUUID"), Usage.MEMBER_CALL),
             ForbiddenRule("direct kotlin.random.Random.Default", "kotlin.random.Random", setOf("Default"), Usage.MEMBER_PROPERTY),
