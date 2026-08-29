@@ -1,0 +1,3 @@
+# Isolated implementation worktrees and local orchestration state
+.worktrees/
+.superpowers/
