@@ -2,6 +2,7 @@
 agp = "9.3.0"
 kotlin = "2.4.10"
 composeCompiler = "2.4.10"
+minSdk = "28"
 compileSdk = "36"
 targetSdk = "36"
 composeBom = "2026.06.00"
@@ -11,6 +12,10 @@ junitPlatform = "1.14.3"
 [libraries]
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
 junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher", version.ref = "junitPlatform" }
+compose-bom = { module = "androidx.compose:compose-bom", version.ref = "composeBom" }
 
 [plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "composeCompiler" }
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
