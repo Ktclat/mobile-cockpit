@@ -2,18 +2,21 @@ package dev.cockpit.architecture
 
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.TimeUnit
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
-import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.fail
 import org.junit.jupiter.api.Test
 import kotlin.io.path.exists
 
 class ModuleGraphTest {
     @Test
     fun presentationCannotReachAdapters() {
-        val graph = GradleModuleGraph.read(projectRoot())
+        assertFrozenGraph(GradleModuleGraph.read(projectRoot()))
+    }
 
+    private fun assertFrozenGraph(graph: GradleModuleGraph) {
         assertEquals(
             expectedProjects,
             graph.declaredProjects,
@@ -58,14 +61,24 @@ class ModuleGraphTest {
     }
 
     @Test
-    fun rejectsProjectDependencySyntaxItCannotValidate() {
+    fun rejectsWhitespaceProjectInclusion() {
         val root = projectRoot()
-
-        assertGraphRejects(root.resolve("settings.gradle.kts")) {
-            "$it\ninclude(\":unexpected\", \":also-unexpected\")\n"
+        val fixtureDirectory = root.resolve("architecture-graph-whitespace-fixture")
+        assertFalse(Files.exists(fixtureDirectory), "The whitespace-inclusion fixture directory must not already exist.")
+        Files.createDirectory(fixtureDirectory)
+        try {
+            assertGraphRejects(root.resolve("settings.gradle.kts")) {
+                "$it\ninclude (\":architecture-graph-whitespace-fixture\")\n"
+            }
+        } finally {
+            Files.deleteIfExists(fixtureDirectory)
         }
-        assertGraphRejects(root.resolve("app/build.gradle.kts")) {
-            "$it\n\ndependencies {\n    implementation(projects.presentation)\n}\n"
+    }
+
+    @Test
+    fun rejectsProductionDependencyInjectedFromRootBuildLogic() {
+        assertGraphRejects(projectRoot().resolve("build.gradle.kts")) {
+            "$it\n\nproject(\":presentation\") {\n    pluginManager.withPlugin(\"java-library\") {\n        dependencies.add(\n            \"implementation\",\n            dependencies.project(mapOf(\"path\" to \":spikes:ssh-transport\")),\n        )\n    }\n}\n"
         }
     }
 
@@ -77,7 +90,13 @@ class ModuleGraphTest {
         val original = Files.readString(file)
         try {
             Files.writeString(file, mutate(original))
-            assertThrows(AssertionError::class.java) { GradleModuleGraph.read(projectRoot()) }
+            val graph = GradleModuleGraph.read(projectRoot())
+            try {
+                assertFrozenGraph(graph)
+            } catch (_: AssertionError) {
+                return
+            }
+            fail<Nothing>("Expected graph rejection, but evaluated production edges were ${graph.productionEdges}.")
         } finally {
             Files.writeString(file, original)
         }
@@ -105,25 +124,49 @@ class ModuleGraphTest {
 
         companion object {
             fun read(root: Path): GradleModuleGraph {
-                val declaredProjects = parseSettings(root.resolve("settings.gradle.kts"))
+                val evaluatedModel = readEvaluatedModel(root)
                 val manifest = parseManifest(root.resolve("gradle/module-graph.txt"))
-                val productionEdges = declaredProjects
-                    .intersect(productionProjects)
-                    .flatMap { source -> parseCanonicalProjectDependencies(root, source) }
+                assertTrue(
+                    structuralProjectPaths.all { it in evaluatedModel.projects },
+                    "Gradle must retain its deterministic root and structural container projects.",
+                )
+                val productionEdges = evaluatedModel.dependencies
+                    .filter { it.source in productionProjects && !it.configuration.contains("test", ignoreCase = true) }
+                    .map { Edge(it.source, it.target) }
                     .toSet()
-                return GradleModuleGraph(declaredProjects, manifest, productionEdges)
+                return GradleModuleGraph(evaluatedModel.projects - structuralProjectPaths, manifest, productionEdges)
             }
 
-            private fun parseSettings(file: Path): Set<String> {
-                assertTrue(file.exists(), "settings.gradle.kts must declare the module graph.")
-                return Files.readString(file).lineSequence().mapIndexedNotNull { index, rawLine ->
-                    val line = rawLine.trim()
-                    includeDeclaration.matchEntire(line)?.groupValues?.get(1) ?: if (line.startsWith("include(")) {
-                        throw AssertionError("Unsupported project inclusion at line ${index + 1}: $line")
+            private fun readEvaluatedModel(root: Path): EvaluatedModel {
+                val initScript = Files.createTempFile("cockpit-module-graph-", ".gradle")
+                val outputFile = Files.createTempFile("cockpit-module-graph-output-", ".txt")
+                try {
+                    Files.writeString(initScript, evaluatedModelInitScript)
+                    val command = if (System.getProperty("os.name").startsWith("Windows")) {
+                        mutableListOf("cmd", "/c", "gradlew.bat")
                     } else {
-                        null
+                        mutableListOf("./gradlew")
+                    }.apply {
+                        addAll(listOf("--no-daemon", "--console=plain", "-I", initScript.toString(), "cockpitModuleGraphSnapshot"))
                     }
-                }.toSet()
+                    val process = ProcessBuilder(command)
+                        .directory(root.toFile())
+                        .redirectErrorStream(true)
+                        .redirectOutput(outputFile.toFile())
+                        .start()
+                    val completed = process.waitFor(60, TimeUnit.SECONDS)
+                    if (!completed) {
+                        process.destroyForcibly()
+                        process.waitFor(10, TimeUnit.SECONDS)
+                    }
+                    val output = Files.readString(outputFile)
+                    assertTrue(completed, "Timed out while reading the evaluated Gradle module graph.\n$output")
+                    assertEquals(0, process.exitValue(), "Unable to read the evaluated Gradle module graph:\n$output")
+                    return parseEvaluatedModel(output)
+                } finally {
+                    Files.deleteIfExists(initScript)
+                    Files.deleteIfExists(outputFile)
+                }
             }
 
             private fun parseManifest(file: Path): Set<Edge> {
@@ -135,29 +178,72 @@ class ModuleGraphTest {
                 }.toSet()
             }
 
-            private fun parseCanonicalProjectDependencies(root: Path, source: String): List<Edge> {
-                val buildFile = root.resolve(source.removePrefix(":").replace(':', '/')).resolve("build.gradle.kts")
-                assertTrue(buildFile.exists(), "Production module $source must declare its Gradle build file.")
-                return Files.readString(buildFile).lineSequence().mapIndexedNotNull { index, rawLine ->
-                    val line = rawLine.trim()
-                    canonicalProjectDependency.matchEntire(line)?.let { match ->
-                        Edge(source, match.groupValues[1])
-                    } ?: if ("project(" in line || "projects." in line) {
-                        throw AssertionError("Unsupported project-dependency expression in $source at line ${index + 1}: $line")
-                    } else {
-                        null
+            private fun parseEvaluatedModel(output: String): EvaluatedModel {
+                val projects = mutableSetOf<String>()
+                val dependencies = mutableSetOf<EvaluatedProjectDependency>()
+                output.lineSequence().forEach { line ->
+                    when {
+                        line.startsWith(projectMarker) -> projects += line.removePrefix(projectMarker)
+                        line.startsWith(dependencyMarker) -> {
+                            val fields = line.removePrefix(dependencyMarker).split('|')
+                            assertEquals(3, fields.size, "Malformed evaluated project dependency: $line")
+                            dependencies += EvaluatedProjectDependency(fields[0], fields[1], fields[2])
+                        }
                     }
-                }.toList()
+                }
+                assertTrue(projects.isNotEmpty(), "The evaluated Gradle module graph produced no project paths.\n$output")
+                return EvaluatedModel(projects, dependencies)
             }
 
-            private val includeDeclaration = Regex("^include\\(\\\"(:[^\\\"]+)\\\"\\)$")
             private val manifestDeclaration = Regex("^(:[A-Za-z0-9-]+(?::[A-Za-z0-9-]+)*) -> (:[A-Za-z0-9-]+(?::[A-Za-z0-9-]+)*)$")
-            private val canonicalProjectDependency =
-                Regex("^implementation\\(project\\(\\\"(:[A-Za-z0-9-]+(?::[A-Za-z0-9-]+)*)\\\"\\)\\)$")
+            private const val projectMarker = "COCKPIT_MODULE_PROJECT="
+            private const val dependencyMarker = "COCKPIT_MODULE_EDGE="
+            private val evaluatedModelInitScript =
+                """
+                gradle.projectsEvaluated {
+                    gradle.rootProject.tasks.register("cockpitModuleGraphSnapshot") {
+                        doLast {
+                            def root = project.rootProject
+                            root.allprojects.collect { it.path }.sort().each {
+                                println("COCKPIT_MODULE_PROJECT=" + it)
+                            }
+                            root.allprojects.each { source ->
+                                source.configurations.each { configuration ->
+                                    configuration.dependencies.withType(org.gradle.api.artifacts.ProjectDependency).each { dependency ->
+                                        println("COCKPIT_MODULE_EDGE=" + source.path + "|" + configuration.name + "|" + dependency.path)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                """.trimIndent()
         }
+
+        private data class EvaluatedModel(
+            val projects: Set<String>,
+            val dependencies: Set<EvaluatedProjectDependency>,
+        )
+
+        private data class EvaluatedProjectDependency(
+            val source: String,
+            val configuration: String,
+            val target: String,
+        )
     }
 
     private companion object {
+        val structuralProjectPaths = setOf(
+            ":",
+            ":agent",
+            ":core",
+            ":data",
+            ":integration",
+            ":platform",
+            ":security",
+            ":spikes",
+        )
+
         val productionProjects = setOf(
             ":app",
             ":presentation",
