@@ -3,7 +3,6 @@ package dev.cockpit.architecture
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
-import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
@@ -70,9 +69,7 @@ class ArchitectureEvidenceTest {
             assertTrue(result.isSuccess, "Evidence output must be consumed and deleted only after process cleanup")
             assertFalse(result.getOrThrow().completed, "The long-lived wrapper must take the timeout path")
         } finally {
-            if (Files.exists(pidFile)) {
-                Files.readString(pidFile).trim().split(',').mapNotNull(String::toLongOrNull).forEach(::terminateForTest)
-            }
+            readRecordedPids(pidFile).forEach(::terminateForTest)
             Files.deleteIfExists(pidFile)
         }
     }
@@ -119,7 +116,7 @@ class ArchitectureEvidenceTest {
             assertFalse(Files.exists(output), "Interrupted evidence processing must delete its known output temp file")
         } finally {
             Thread.interrupted()
-            if (Files.exists(pidFile)) awaitPidFile(pidFile).forEach(::terminateForTest)
+            readRecordedPids(pidFile).forEach(::terminateForTest)
             Files.deleteIfExists(pidFile)
             Files.deleteIfExists(output)
         }
@@ -130,15 +127,133 @@ class ArchitectureEvidenceTest {
         val pidFile = Files.createTempFile("cockpit-evidence-process-wrapper-exit-", ".pids")
         val output = Files.createTempFile("cockpit-evidence-process-wrapper-exit-", ".txt")
         try {
-            runEvidenceProcess(timeoutWrapperCommand(pidFile), projectRoot(), 30, TimeUnit.SECONDS, output) { wrapper ->
-                awaitPidFile(pidFile)
-                wrapper.destroyForcibly()
-            }
+            runEvidenceProcess(
+                timeoutWrapperCommand(pidFile),
+                projectRoot(),
+                30,
+                TimeUnit.SECONDS,
+                output,
+                afterStart = { wrapper ->
+                    awaitPidFile(pidFile)
+                    wrapper.destroyForcibly()
+                },
+            )
             assertTrue(awaitPidFile(pidFile).none(::isProcessAlive), "A dead wrapper must not hide a live captured child")
             assertFalse(Files.exists(output), "Output must be deleted only after the captured tree is reaped")
         } finally {
-            if (Files.exists(pidFile)) awaitPidFile(pidFile).forEach(::terminateForTest)
+            readRecordedPids(pidFile).forEach(::terminateForTest)
             Files.deleteIfExists(pidFile)
+            Files.deleteIfExists(output)
+        }
+    }
+
+    @Test
+    fun readsEvidenceOutputOnlyAfterEveryCapturedProcessExits() {
+        val pidFile = Files.createTempFile("cockpit-evidence-process-read-order-", ".pids")
+        val output = Files.createTempFile("cockpit-evidence-process-read-order-", ".txt")
+        var recordedPids = emptyList<Long>()
+        try {
+            runEvidenceProcess(
+                command = timeoutWrapperCommand(pidFile),
+                root = projectRoot(),
+                timeout = 30,
+                unit = TimeUnit.SECONDS,
+                output = output,
+                afterStart = { wrapper ->
+                    recordedPids = awaitPidFile(pidFile)
+                    wrapper.destroyForcibly()
+                },
+                readOutput = { path ->
+                    assertTrue(
+                        recordedPids.none(::isProcessAlive),
+                        "Evidence output must not be read while any captured descendant is alive",
+                    )
+                    Files.readString(path)
+                },
+            )
+        } finally {
+            recordedPids.forEach(::terminateForTest)
+            Files.deleteIfExists(pidFile)
+            Files.deleteIfExists(output)
+        }
+    }
+
+    @Test
+    fun preservesPrimaryFailureAndSuppressesCleanupFailure() {
+        val output = Files.createTempFile("cockpit-evidence-process-primary-failure-", ".txt")
+        val primary = IllegalStateException("primary evidence failure")
+        try {
+            val thrown = assertThrows(IllegalStateException::class.java) {
+                runEvidenceProcess(
+                    command = successfulEvidenceCommand(),
+                    root = projectRoot(),
+                    timeout = 5,
+                    unit = TimeUnit.SECONDS,
+                    output = output,
+                    afterStart = { throw primary },
+                    deleteOutput = { _, _ -> false },
+                    deferOutputDeletion = { _, _, _ -> DeferredDeletionOutcome.DELETE_FAILED },
+                )
+            }
+
+            assertTrue(thrown === primary, "Cleanup failure must not replace the original evidence failure")
+            val cleanupFailure = thrown.suppressed.singleOrNull()
+            assertTrue(
+                cleanupFailure is EvidenceProcessCleanupException,
+                "Cleanup failure must be attached to the original failure as suppressed evidence",
+            )
+            assertTrue(
+                (cleanupFailure as EvidenceProcessCleanupException).deferredDeletionOutcome ==
+                    DeferredDeletionOutcome.DELETE_FAILED,
+                "The suppressed cleanup failure must expose the bounded deferred deletion outcome",
+            )
+        } finally {
+            Files.deleteIfExists(output)
+        }
+    }
+
+    @Test
+    fun boundsAndReportsDeferredDeletionWhenCapturedProcessStaysAlive() {
+        val output = Files.createTempFile("cockpit-evidence-process-deferred-timeout-", ".txt")
+        val process = ProcessBuilder(longRunningEvidenceCommand()).start()
+        try {
+            val outcome = scheduleDeferredOutputDeletion(
+                output = output,
+                capturedTree = mapOf(process.pid() to process.toHandle()),
+                interruptState = InterruptState(),
+                timeout = 50,
+                unit = TimeUnit.MILLISECONDS,
+            )
+
+            assertTrue(
+                outcome == DeferredDeletionOutcome.RETAINED_LIVE_PROCESS,
+                "A bounded deferred cleanup must report that output was retained for a live process",
+            )
+            assertTrue(Files.exists(output), "Deferred cleanup must not delete output while its process is alive")
+        } finally {
+            terminateForTest(process.pid())
+            Files.deleteIfExists(output)
+        }
+    }
+
+    @Test
+    fun reportsDeferredDeletionFailureAfterCapturedProcessesExit() {
+        val output = Files.createTempFile("cockpit-evidence-process-deferred-delete-failure-", ".txt")
+        try {
+            val outcome = scheduleDeferredOutputDeletion(
+                output = output,
+                capturedTree = emptyMap(),
+                interruptState = InterruptState(),
+                timeout = 50,
+                unit = TimeUnit.MILLISECONDS,
+                deleteOutput = { _, _ -> false },
+            )
+
+            assertTrue(
+                outcome == DeferredDeletionOutcome.DELETE_FAILED,
+                "A final deferred delete failure must be returned to the caller rather than ignored",
+            )
+        } finally {
             Files.deleteIfExists(output)
         }
     }
@@ -241,10 +356,16 @@ class ArchitectureEvidenceTest {
         unit: TimeUnit,
         output: Path = Files.createTempFile("cockpit-evidence-process-", ".txt"),
         afterStart: (Process) -> Unit = {},
+        readOutput: (Path) -> String = { path -> Files.readString(path) },
+        deleteOutput: (Path, InterruptState) -> Boolean = ::deleteEvidenceOutput,
+        deferOutputDeletion: (Path, Map<Long, ProcessHandle>, InterruptState) -> DeferredDeletionOutcome =
+            { path, tree, state -> scheduleDeferredOutputDeletion(path, tree, state) },
     ): EvidenceProcessResult {
         var process: Process? = null
         val capturedTree = linkedMapOf<Long, ProcessHandle>()
         val interruptState = InterruptState()
+        var result: EvidenceProcessResult? = null
+        var primaryFailure: Throwable? = null
         try {
             val started = ProcessBuilder(command)
                 .directory(root.toFile())
@@ -256,31 +377,93 @@ class ArchitectureEvidenceTest {
             afterStart(started)
             captureProcessTree(started, capturedTree)
             val completed = waitForEvidenceProcess(started, timeout, unit, capturedTree)
-            if (!completed && !terminateAndReapProcessTree(started, capturedTree, interruptState)) {
+            if (!terminateAndReapProcessTree(started, capturedTree, interruptState)) {
                 throw EvidenceProcessCleanupException("Evidence process tree did not terminate within the bounded cleanup timeout")
             }
-            return EvidenceProcessResult(
+            result = EvidenceProcessResult(
                 completed = completed,
                 exitCode = if (completed) started.exitValue() else null,
-                output = Files.readString(output),
+                output = readOutput(output),
             )
-        } catch (error: InterruptedException) {
-            interruptState.observed = true
-            throw error
+        } catch (error: Throwable) {
+            if (error is InterruptedException) interruptState.observed = true
+            primaryFailure = error
         } finally {
             if (Thread.interrupted()) interruptState.observed = true
-            val cleanupSucceeded = process?.let { started ->
-                terminateAndReapProcessTree(started, capturedTree, interruptState)
-            } ?: true
-            val outputDeleted = cleanupSucceeded && deleteEvidenceOutput(output, interruptState)
-            if (!cleanupSucceeded || !outputDeleted) {
-                scheduleDeferredOutputDeletion(output, capturedTree)
+            val cleanupFailure = finishEvidenceProcess(
+                process = process,
+                capturedTree = capturedTree,
+                output = output,
+                interruptState = interruptState,
+                deleteOutput = deleteOutput,
+                deferOutputDeletion = deferOutputDeletion,
+            )
+            if (cleanupFailure != null) {
+                if (primaryFailure == null) {
+                    primaryFailure = cleanupFailure
+                } else {
+                    primaryFailure.addSuppressed(cleanupFailure)
+                }
             }
             if (interruptState.observed) Thread.currentThread().interrupt()
-            if ((!cleanupSucceeded || !outputDeleted) && !interruptState.observed) {
-                throw EvidenceProcessCleanupException("Evidence process cleanup failed; deferred output deletion was scheduled")
-            }
         }
+        primaryFailure?.let { throw it }
+        return checkNotNull(result) { "Evidence process produced neither a result nor a failure" }
+    }
+
+    private fun finishEvidenceProcess(
+        process: Process?,
+        capturedTree: MutableMap<Long, ProcessHandle>,
+        output: Path,
+        interruptState: InterruptState,
+        deleteOutput: (Path, InterruptState) -> Boolean,
+        deferOutputDeletion: (Path, Map<Long, ProcessHandle>, InterruptState) -> DeferredDeletionOutcome,
+    ): EvidenceProcessCleanupException? {
+        val cleanupSucceeded = try {
+            process?.let { started -> terminateAndReapProcessTree(started, capturedTree, interruptState) } ?: true
+        } catch (error: Throwable) {
+            return cleanupException(
+                "Evidence process cleanup threw; output retained at $output",
+                error,
+                interruptState,
+            )
+        }
+        if (cleanupSucceeded) {
+            val outputDeleted = try {
+                deleteOutput(output, interruptState)
+            } catch (error: Throwable) {
+                return cleanupException(
+                    "Evidence output deletion threw; output retained at $output",
+                    error,
+                    interruptState,
+                )
+            }
+            if (outputDeleted) return null
+        }
+
+        val deferredOutcome = try {
+            deferOutputDeletion(output, capturedTree, interruptState)
+        } catch (error: Throwable) {
+            return cleanupException(
+                "Bounded deferred output cleanup threw; output retained at $output",
+                error,
+                interruptState,
+            )
+        }
+        if (cleanupSucceeded && deferredOutcome == DeferredDeletionOutcome.DELETED) return null
+        return EvidenceProcessCleanupException(
+            "Evidence process cleanup did not complete; deferred deletion outcome=$deferredOutcome; output=$output",
+            deferredDeletionOutcome = deferredOutcome,
+        )
+    }
+
+    private fun cleanupException(
+        message: String,
+        error: Throwable,
+        interruptState: InterruptState,
+    ): EvidenceProcessCleanupException {
+        if (error is InterruptedException) interruptState.observed = true
+        return EvidenceProcessCleanupException(message, cause = error)
     }
 
     private fun waitForEvidenceProcess(
@@ -385,13 +568,40 @@ class ArchitectureEvidenceTest {
         }
     }
 
-    private fun scheduleDeferredOutputDeletion(output: Path, capturedTree: Map<Long, ProcessHandle>) {
-        CompletableFuture.allOf(*capturedTree.values.map(ProcessHandle::onExit).toTypedArray()).whenComplete { _, _ ->
-            val deferredInterruptState = InterruptState()
-            deleteEvidenceOutput(output, deferredInterruptState)
-            if (deferredInterruptState.observed) Thread.currentThread().interrupt()
+    private fun scheduleDeferredOutputDeletion(
+        output: Path,
+        capturedTree: Map<Long, ProcessHandle>,
+        interruptState: InterruptState,
+        timeout: Long = processCleanupTimeoutSeconds,
+        unit: TimeUnit = TimeUnit.SECONDS,
+        deleteOutput: (Path, InterruptState) -> Boolean = ::deleteEvidenceOutput,
+    ): DeferredDeletionOutcome {
+        val deadline = System.nanoTime() + unit.toNanos(timeout)
+        var allExited = true
+        capturedTree.values.forEach { process ->
+            if (!waitForExit(process, deadline, interruptState)) allExited = false
+        }
+        if (!allExited) return DeferredDeletionOutcome.RETAINED_LIVE_PROCESS
+        return if (deleteOutput(output, interruptState)) {
+            DeferredDeletionOutcome.DELETED
+        } else {
+            DeferredDeletionOutcome.DELETE_FAILED
         }
     }
+
+    private fun successfulEvidenceCommand(): List<String> =
+        if (System.getProperty("os.name").startsWith("Windows")) {
+            listOf("cmd", "/c", "exit", "0")
+        } else {
+            listOf("sh", "-c", "exit 0")
+        }
+
+    private fun longRunningEvidenceCommand(): List<String> =
+        if (System.getProperty("os.name").startsWith("Windows")) {
+            listOf("powershell", "-NoProfile", "-Command", "Start-Sleep -Seconds 30")
+        } else {
+            listOf("sh", "-c", "sleep 30")
+        }
 
     private fun timeoutWrapperCommand(pidFile: Path): List<String> =
         if (System.getProperty("os.name").startsWith("Windows")) {
@@ -419,16 +629,22 @@ class ArchitectureEvidenceTest {
     }
 
     private fun awaitPidFile(pidFile: Path): List<Long> {
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(processSetupTimeoutSeconds)
         while (System.nanoTime() < deadline) {
-            if (Files.exists(pidFile)) {
-                val pids = Files.readString(pidFile).trim().split(',').mapNotNull(String::toLongOrNull)
-                if (pids.size == 2) return pids
-            }
+            val pids = readRecordedPids(pidFile)
+            if (pids.size == 2) return pids
             Thread.sleep(10)
         }
         throw AssertionError("The wrapper did not record both PIDs within the bounded setup time")
     }
+
+    private fun readRecordedPids(pidFile: Path): List<Long> =
+        if (Files.exists(pidFile)) {
+            runCatching { Files.readString(pidFile).trim().split(',').mapNotNull(String::toLongOrNull) }
+                .getOrDefault(emptyList())
+        } else {
+            emptyList()
+        }
 
     private fun requireContains(content: String, value: String, message: String, failures: MutableList<String>) {
         if (!content.contains(value)) failures += message
@@ -479,13 +695,25 @@ class ArchitectureEvidenceTest {
         val output: String,
     )
 
-    private class EvidenceProcessCleanupException(message: String) : IllegalStateException(message)
+    private class EvidenceProcessCleanupException(
+        message: String,
+        val deferredDeletionOutcome: DeferredDeletionOutcome? = null,
+        cause: Throwable? = null,
+    ) :
+        IllegalStateException(message, cause)
 
     private class InterruptState(var observed: Boolean = false)
+
+    private enum class DeferredDeletionOutcome {
+        DELETED,
+        RETAINED_LIVE_PROCESS,
+        DELETE_FAILED,
+    }
 
     private companion object {
         const val architectureSource = "docs/superpowers/specs/2026-08-30-system-architecture-v0.1.md"
         const val processCleanupTimeoutSeconds = 5L
+        const val processSetupTimeoutSeconds = 5L
         const val processCapturePollMillis = 10L
         const val processOutputDeleteRetryMillis = 10L
         val canonicalWorkflow = """
