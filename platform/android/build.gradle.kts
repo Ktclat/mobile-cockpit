@@ -2,6 +2,12 @@ plugins {
     alias(libs.plugins.android.library)
 }
 
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
 android {
     namespace = "dev.cockpit.platform.android"
     compileSdk = libs.versions.compileSdk.get().toInt()
