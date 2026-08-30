@@ -1,7 +1,9 @@
 package dev.cockpit.architecture
 
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 import kotlin.io.path.exists
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -12,48 +14,44 @@ import org.junit.jupiter.api.Test
 class ArchitectureEvidenceTest {
     @Test
     fun rejectsCommentedWorkflowTriggers() {
-        assertEvidenceRejects(".github/workflows/android.yml") {
-            it.replace("on:\n  push:\n  pull_request:", "# on:\n#   push:\n#   pull_request:")
-        }
+        assertWorkflowRejected(canonicalWorkflow.replace("on:\n  push:\n  pull_request:", "# on:\n#   push:\n#   pull_request:"))
     }
 
     @Test
     fun rejectsEchoInsteadOfWorkflowGradleExecution() {
-        assertEvidenceRejects(".github/workflows/android.yml") {
-            it.replace(
+        assertWorkflowRejected(
+            canonicalWorkflow.replace(
                 "run: ./gradlew test verifyArchitecture :app:assembleDebug lint",
                 "run: echo \"./gradlew test verifyArchitecture :app:assembleDebug lint\"",
-            )
-        }
+            ),
+        )
     }
 
     @Test
     fun rejectsWorkflowSetupJavaValuesUnderAnUnrelatedStep() {
-        assertEvidenceRejects(".github/workflows/android.yml") {
-            it.replace(
+        assertWorkflowRejected(
+            canonicalWorkflow.replace(
                 "      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961\n        with:",
                 "      - name: unrelated step\n        with:\n          distribution: temurin\n          java-version: '17'\n          cache: gradle\n          check-latest: false\n      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961\n        with:",
-            )
-        }
+            ),
+        )
     }
 
     @Test
     fun rejectsAmbiguousDuplicateSetupJavaDeclaration() {
-        assertEvidenceRejects(".github/workflows/android.yml") {
-            it.replace("          distribution: temurin", "          distribution: temurin\n          distribution: temurin")
-        }
+        assertWorkflowRejected(canonicalWorkflow.replace("          distribution: temurin", "          distribution: temurin\n          distribution: temurin"))
     }
 
     @Test
     fun rejectsDetektValuesOutsideTheirRequiredSections() {
-        assertEvidenceRejects("config/detekt/detekt.yml") {
+        assertDetektRejected(
             """
             build:
               validation: true
             config:
               maxIssues: 0
-            """.trimIndent() + "\n"
-        }
+            """.trimIndent() + "\n",
+        )
     }
 
     @Test
@@ -75,6 +73,69 @@ class ArchitectureEvidenceTest {
             }
             Files.deleteIfExists(pidFile)
         }
+    }
+
+    @Test
+    fun deletesKnownOutputWhenEvidenceProcessCannotStart() {
+        val output = Files.createTempFile("cockpit-evidence-process-start-failure-", ".txt")
+        try {
+            assertThrows(IOException::class.java) {
+                runEvidenceProcess(
+                    command = listOf("cockpit-command-that-does-not-exist"),
+                    root = projectRoot(),
+                    timeout = 1,
+                    unit = TimeUnit.SECONDS,
+                    output = output,
+                )
+            }
+            assertFalse(Files.exists(output), "A failed ProcessBuilder.start must delete its known output temp file")
+        } finally {
+            Files.deleteIfExists(output)
+        }
+    }
+
+    @Test
+    fun interruptionReapsEvidenceProcessTreeAndDeletesKnownOutput() {
+        val pidFile = Files.createTempFile("cockpit-evidence-process-interrupt-", ".pids")
+        val output = Files.createTempFile("cockpit-evidence-process-interrupt-", ".txt")
+        try {
+            assertThrows(InterruptedException::class.java) {
+                runEvidenceProcess(
+                    command = timeoutWrapperCommand(pidFile),
+                    root = projectRoot(),
+                    timeout = 30,
+                    unit = TimeUnit.SECONDS,
+                    output = output,
+                    afterStart = {
+                        awaitPidFile(pidFile)
+                        Thread.currentThread().interrupt()
+                    },
+                )
+            }
+            assertTrue(Thread.interrupted(), "Interrupted evidence processing must restore the interrupt status")
+            assertTrue(awaitPidFile(pidFile).none(::isProcessAlive), "Interrupted evidence processing must reap wrapper and child")
+            assertFalse(Files.exists(output), "Interrupted evidence processing must delete its known output temp file")
+        } finally {
+            Thread.interrupted()
+            if (Files.exists(pidFile)) awaitPidFile(pidFile).forEach(::terminateForTest)
+            Files.deleteIfExists(pidFile)
+            Files.deleteIfExists(output)
+        }
+    }
+
+    @Test
+    fun pureMutationValidatorsLeaveTrackedEvidenceUnchanged() {
+        val root = projectRoot()
+        val workflow = root.resolve(".github/workflows/android.yml")
+        val detekt = root.resolve("config/detekt/detekt.yml")
+        val originalWorkflow = Files.readString(workflow)
+        val originalDetekt = Files.readString(detekt)
+
+        assertWorkflowRejected(originalWorkflow.replace("on:", "# on:"))
+        assertDetektRejected(originalDetekt.replace("maxIssues: 0", "maxIssues: 1"))
+
+        assertTrue(Files.readString(workflow) == originalWorkflow, "Pure workflow validation must not write tracked evidence")
+        assertTrue(Files.readString(detekt) == originalDetekt, "Pure Detekt validation must not write tracked evidence")
     }
 
     @Test
@@ -105,7 +166,7 @@ class ArchitectureEvidenceTest {
         if (!workflow.exists()) {
             failures += "Missing CI workflow: .github/workflows/android.yml"
         } else {
-            requireCanonical(Files.readString(workflow), canonicalWorkflow, "CI workflow must use the one supported fail-closed foundation structure", failures)
+            failures += validateWorkflow(Files.readString(workflow))
         }
 
         val rootBuild = root.resolve("build.gradle.kts")
@@ -121,7 +182,7 @@ class ArchitectureEvidenceTest {
         if (!detekt.exists()) {
             failures += "Missing fail-closed Detekt configuration: config/detekt/detekt.yml"
         } else {
-            requireCanonical(Files.readString(detekt), canonicalDetektConfig, "Detekt configuration must keep maxIssues and validation under their required sections", failures)
+            failures += validateDetekt(Files.readString(detekt))
         }
 
         val gradlewMode = gitMode(root, "gradlew")
@@ -158,31 +219,43 @@ class ArchitectureEvidenceTest {
         root: Path,
         timeout: Long,
         unit: TimeUnit,
+        output: Path = Files.createTempFile("cockpit-evidence-process-", ".txt"),
+        afterStart: (Process) -> Unit = {},
     ): EvidenceProcessResult {
-        val output = Files.createTempFile("cockpit-evidence-process-", ".txt")
-        var outputCanBeDeleted = false
+        var process: Process? = null
+        var interrupted = false
         try {
-            val process = ProcessBuilder(command)
+            val started = ProcessBuilder(command)
                 .directory(root.toFile())
                 .redirectErrorStream(true)
                 .redirectOutput(output.toFile())
                 .start()
-            val completed = process.waitFor(timeout, unit)
-            if (!completed && !terminateAndReapProcessTree(process)) {
-                return EvidenceProcessResult(
-                    completed = false,
-                    exitCode = null,
-                    output = "Evidence process tree did not terminate within the bounded cleanup timeout",
-                )
+            process = started
+            afterStart(started)
+            val completed = started.waitFor(timeout, unit)
+            if (!completed && !terminateAndReapProcessTree(started)) {
+                throw EvidenceProcessCleanupException("Evidence process tree did not terminate within the bounded cleanup timeout")
             }
-            outputCanBeDeleted = true
             return EvidenceProcessResult(
                 completed = completed,
-                exitCode = if (completed) process.exitValue() else null,
+                exitCode = if (completed) started.exitValue() else null,
                 output = Files.readString(output),
             )
+        } catch (error: InterruptedException) {
+            interrupted = true
+            throw error
         } finally {
-            if (outputCanBeDeleted) Files.deleteIfExists(output)
+            val cleanupSucceeded = process?.let { started ->
+                if (started.isAlive) terminateAndReapProcessTree(started) else true
+            } ?: true
+            if (cleanupSucceeded) {
+                Files.deleteIfExists(output)
+            } else {
+                scheduleDeferredOutputDeletion(output, process)
+                if (interrupted) Thread.currentThread().interrupt()
+                throw EvidenceProcessCleanupException("Evidence process cleanup failed; deferred output deletion was scheduled")
+            }
+            if (interrupted) Thread.currentThread().interrupt()
         }
     }
 
@@ -218,6 +291,13 @@ class ArchitectureEvidenceTest {
         }
     }
 
+    private fun scheduleDeferredOutputDeletion(output: Path, process: Process) {
+        val handles = (process.toHandle().descendants().toList() + process.toHandle()).distinct()
+        CompletableFuture.allOf(*handles.map(ProcessHandle::onExit).toTypedArray()).whenComplete { _, _ ->
+            runCatching { Files.deleteIfExists(output) }
+        }
+    }
+
     private fun timeoutWrapperCommand(pidFile: Path): List<String> =
         if (System.getProperty("os.name").startsWith("Windows")) {
             listOf(
@@ -243,6 +323,18 @@ class ArchitectureEvidenceTest {
         }
     }
 
+    private fun awaitPidFile(pidFile: Path): List<Long> {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+        while (System.nanoTime() < deadline) {
+            if (Files.exists(pidFile)) {
+                val pids = Files.readString(pidFile).trim().split(',').mapNotNull(String::toLongOrNull)
+                if (pids.size == 2) return pids
+            }
+            Thread.sleep(10)
+        }
+        throw AssertionError("The wrapper did not record both PIDs within the bounded setup time")
+    }
+
     private fun requireContains(content: String, value: String, message: String, failures: MutableList<String>) {
         if (!content.contains(value)) failures += message
     }
@@ -257,25 +349,24 @@ class ArchitectureEvidenceTest {
         if (content.contains(value)) failures += message
     }
 
-    private fun requireCanonical(content: String, canonical: String, message: String, failures: MutableList<String>) {
+    private fun validateWorkflow(content: String): List<String> =
+        validateCanonical(content, canonicalWorkflow, "CI workflow must use the one supported fail-closed foundation structure")
+
+    private fun validateDetekt(content: String): List<String> =
+        validateCanonical(content, canonicalDetektConfig, "Detekt configuration must keep maxIssues and validation under their required sections")
+
+    private fun validateCanonical(content: String, canonical: String, message: String): List<String> {
         val normalized = content.replace("\r\n", "\n").trimEnd() + "\n"
-        if (normalized != canonical) failures += message
+        return if (normalized == canonical) emptyList() else listOf(message)
     }
 
     private fun requireExactlyOne(content: String, declaration: Regex, message: String, failures: MutableList<String>) {
         if (declaration.findAll(content).count() != 1) failures += message
     }
 
-    private fun assertEvidenceRejects(path: String, mutate: (String) -> String) {
-        val file = projectRoot().resolve(path)
-        val original = Files.readString(file)
-        try {
-            Files.writeString(file, mutate(original))
-            assertThrows(AssertionError::class.java) { requiresAcceptedFoundationAdrsAndCiTasks() }
-        } finally {
-            Files.writeString(file, original)
-        }
-    }
+    private fun assertWorkflowRejected(content: String) = assertTrue(validateWorkflow(content).isNotEmpty())
+
+    private fun assertDetektRejected(content: String) = assertTrue(validateDetekt(content).isNotEmpty())
 
     private fun projectRoot(): Path =
         generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath()) { it.parent }
@@ -292,6 +383,8 @@ class ArchitectureEvidenceTest {
         val exitCode: Int?,
         val output: String,
     )
+
+    private class EvidenceProcessCleanupException(message: String) : IllegalStateException(message)
 
     private companion object {
         const val architectureSource = "docs/superpowers/specs/2026-08-30-system-architecture-v0.1.md"
