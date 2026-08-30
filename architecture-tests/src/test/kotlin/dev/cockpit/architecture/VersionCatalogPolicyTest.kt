@@ -3,7 +3,9 @@ package dev.cockpit.architecture
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
+import java.util.Comparator
 import java.util.Properties
+import java.util.concurrent.TimeUnit
 import javax.xml.parsers.DocumentBuilderFactory
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -38,6 +40,27 @@ class VersionCatalogPolicyTest {
         assertTrue(
             sha256(wrapperJar) == "497c8c2a7e5031f6aa847f88104aa80a93532ec32ee17bdb8d1d2f67a194a9c7",
             "The Gradle wrapper JAR must match the official Gradle 9.5.0 SHA-256 checksum.",
+        )
+    }
+
+    @Test
+    fun requiresVerifiedAapt2BinariesForWindowsAndLinuxCi() {
+        val artifacts = verifiedArtifactChecksums(
+            metadata = projectRoot().resolve("gradle/verification-metadata.xml"),
+            group = "com.android.tools.build",
+            name = "aapt2",
+            version = "9.3.0-15703166",
+        )
+
+        assertEquals(
+            setOf("b1006ecec7e5936257e95e97f3eba7ef439d3e44178967cc048f86c9119fb231"),
+            artifacts["aapt2-9.3.0-15703166-windows.jar"],
+            "The frozen Windows AAPT2 binary must retain its verified checksum.",
+        )
+        assertEquals(
+            setOf("e772a3dae8354764f1b0793903218427f483982445207f2e4ffc8c2026755bd4"),
+            artifacts["aapt2-9.3.0-15703166-linux.jar"],
+            "Linux CI must have the exact official frozen AAPT2 binary checksum.",
         )
     }
 
@@ -87,9 +110,103 @@ class VersionCatalogPolicyTest {
         assertArrayEquals(originalWrapperBytes, Files.readAllBytes(wrapperPath), "Wrapper validation must be pure.")
     }
 
+    @Test
+    fun evaluatedGradleAuthorityAcceptsCurrentFixedDependencyDeclarations() {
+        val result = runEvaluatedDependencyPolicy()
+
+        assertTrue(
+            result.completed && result.exitCode == 0,
+            "Current evaluated external dependency declarations must remain fixed and accepted.\n${result.output}",
+        )
+    }
+
+    @Test
+    fun evaluatedGradleAuthorityRejectsDynamicDeclarationsOutsideTheCatalog() {
+        val result = runEvaluatedDependencyPolicy(dynamicDependencyFixture)
+        val missingEvidence = dynamicDependencyEvidence.filterNot(result.output::contains)
+
+        assertFalse(
+            result.completed && result.exitCode == 0,
+            "Evaluated Gradle policy must reject direct dynamic declarations in root, custom, subproject, " +
+                "dependency-constraint, and buildscript configurations.\n${result.output}",
+        )
+        assertTrue(
+            missingEvidence.isEmpty(),
+            "Evaluated policy failure must identify every injected dynamic declaration; missing $missingEvidence.\n${result.output}",
+        )
+    }
+
     private fun projectRoot(): Path =
         generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath()) { it.parent }
             .first { it.resolve(".git").exists() }
+
+    private fun runEvaluatedDependencyPolicy(fixture: GradleFixture? = null): GradleResult {
+        val root = projectRoot()
+        val tempDirectory = Files.createTempDirectory("cockpit-dependency-policy-")
+        val fixtureRoot = fixture?.let { tempDirectory.resolve("fixture") }
+        val policyScript = tempDirectory.resolve("dependency-policy.gradle")
+        val outputFile = tempDirectory.resolve("output.txt")
+        var process: Process? = null
+        try {
+            Files.writeString(policyScript, evaluatedDependencyPolicyInitScript)
+            if (fixtureRoot != null) {
+                Files.createDirectories(fixtureRoot.resolve("child"))
+                Files.writeString(fixtureRoot.resolve("settings.gradle"), fixture.settings)
+                Files.writeString(fixtureRoot.resolve("build.gradle"), fixture.rootBuild)
+                Files.writeString(fixtureRoot.resolve("child/build.gradle"), fixture.childBuild)
+            }
+            val command = if (System.getProperty("os.name").startsWith("Windows")) {
+                mutableListOf("cmd", "/c", "gradlew.bat")
+            } else {
+                mutableListOf("./gradlew")
+            }.apply {
+                addAll(
+                    listOf(
+                        "--no-daemon",
+                        "--offline",
+                        "--console=plain",
+                        "--project-cache-dir",
+                        tempDirectory.resolve("project-cache").toString(),
+                        "-I",
+                        policyScript.toString(),
+                    ),
+                )
+                if (fixtureRoot != null) addAll(listOf("-p", fixtureRoot.toString()))
+                add("help")
+            }
+            val started = ProcessBuilder(command)
+                .directory(root.toFile())
+                .redirectErrorStream(true)
+                .redirectOutput(outputFile.toFile())
+                .start()
+            process = started
+            val completed = started.waitFor(90, TimeUnit.SECONDS)
+            if (!completed) terminateProcessTree(started)
+            return GradleResult(
+                completed = completed,
+                exitCode = if (completed) started.exitValue() else null,
+                output = Files.readString(outputFile),
+            )
+        } finally {
+            if (process?.isAlive == true) terminateProcessTree(process)
+            deleteTree(tempDirectory)
+        }
+    }
+
+    private fun terminateProcessTree(process: Process) {
+        val descendants = process.descendants().toList().asReversed()
+        descendants.forEach { it.destroyForcibly() }
+        process.destroyForcibly()
+        descendants.forEach { it.onExit().get(10, TimeUnit.SECONDS) }
+        process.waitFor(10, TimeUnit.SECONDS)
+    }
+
+    private fun deleteTree(root: Path) {
+        if (!Files.exists(root)) return
+        Files.walk(root).use { paths ->
+            paths.sorted(Comparator.reverseOrder()).forEach(Files::deleteIfExists)
+        }
+    }
 
     private fun validateCatalogPolicy(catalog: String, verifiedComponents: Set<String>) {
         val parsedCatalog = parseCatalog(catalog)
@@ -263,12 +380,52 @@ class VersionCatalogPolicyTest {
         }
     }
 
+    private fun verifiedArtifactChecksums(
+        metadata: Path,
+        group: String,
+        name: String,
+        version: String,
+    ): Map<String, Set<String>> {
+        val document = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(metadata.toFile())
+        val components = document.getElementsByTagName("component")
+        val component = (0 until components.length)
+            .map(components::item)
+            .singleOrNull { candidate ->
+                candidate.attributes.let { attributes ->
+                    attributes.getNamedItem("group")?.nodeValue == group &&
+                        attributes.getNamedItem("name")?.nodeValue == name &&
+                        attributes.getNamedItem("version")?.nodeValue == version
+                }
+            } ?: throw AssertionError("Missing or duplicate verification component '$group:$name:$version'.")
+
+        return (0 until component.childNodes.length)
+            .map(component.childNodes::item)
+            .filter { it.nodeName == "artifact" }
+            .associate { artifact ->
+                val artifactName = artifact.attributes.getNamedItem("name")?.nodeValue
+                    ?: throw AssertionError("Verification artifact is missing its name.")
+                val checksums = (0 until artifact.childNodes.length)
+                    .map(artifact.childNodes::item)
+                    .filter { it.nodeName == "sha256" }
+                    .map { checksum ->
+                        checksum.attributes.getNamedItem("value")?.nodeValue
+                            ?: throw AssertionError("Artifact '$artifactName' has a SHA-256 entry without a value.")
+                    }
+                    .toSet()
+                artifactName to checksums
+            }
+    }
+
     private fun sha256(file: Path): String =
         MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(file)).joinToString("") { byte ->
             "%02x".format(byte.toInt() and 0xff)
         }
 
     private data class Catalog(val versions: Map<String, String>, val aliases: List<Alias>)
+
+    private data class GradleResult(val completed: Boolean, val exitCode: Int?, val output: String)
+
+    private data class GradleFixture(val settings: String, val rootBuild: String, val childBuild: String)
 
     private data class CatalogAdversary(val description: String, val mutate: (String) -> String)
 
@@ -286,6 +443,110 @@ class VersionCatalogPolicyTest {
     private enum class CatalogSection { VERSIONS, LIBRARIES, PLUGINS }
 
     private companion object {
+        val evaluatedDependencyPolicyInitScript =
+            """
+            gradle.projectsEvaluated {
+                def violations = []
+                def dynamicSelector = { selector ->
+                    if (selector == null) return false
+                    def value = selector.toString().trim()
+                    value.contains("+") ||
+                        value.contains("*") ||
+                        value ==~ /(?i).*latest\..*/ ||
+                        value ==~ /.*[\[\]()].*/
+                }
+                def inspectConstraint = { owner, scope, configuration, kind, group, name, constraint ->
+                    def selectors = [
+                        required: constraint.requiredVersion,
+                        strict: constraint.strictVersion,
+                        preferred: constraint.preferredVersion,
+                    ]
+                    if (constraint.hasProperty("branch") && constraint.branch != null) {
+                        selectors.branch = constraint.branch
+                    }
+                    selectors.findAll { label, value -> dynamicSelector(value) }.each { label, value ->
+                        violations.add(
+                            owner.path + "|" + scope + "|" + configuration.name + "|" + kind + "|" +
+                                group + ":" + name + "|" + label + "=" + value,
+                        )
+                    }
+                }
+                def inspectConfigurations = { owner, scope, configurations ->
+                    configurations.each { configuration ->
+                        configuration.dependencies.withType(org.gradle.api.artifacts.ExternalModuleDependency).each { dependency ->
+                            inspectConstraint(
+                                owner,
+                                scope,
+                                configuration,
+                                "dependency",
+                                dependency.group,
+                                dependency.name,
+                                dependency.versionConstraint,
+                            )
+                        }
+                        configuration.dependencyConstraints.each { constraint ->
+                            inspectConstraint(
+                                owner,
+                                scope,
+                                configuration,
+                                "constraint",
+                                constraint.group,
+                                constraint.name,
+                                constraint.versionConstraint,
+                            )
+                        }
+                    }
+                }
+
+                gradle.rootProject.allprojects.each { candidate ->
+                    inspectConfigurations(candidate, "project", candidate.configurations)
+                    inspectConfigurations(candidate, "buildscript", candidate.buildscript.configurations)
+                }
+                if (!violations.isEmpty()) {
+                    violations.sort().each { println("COCKPIT_DYNAMIC_DEPENDENCY_POLICY=" + it) }
+                    throw new GradleException(
+                        "Dynamic external dependency declarations are forbidden; " + violations.size() + " violation(s).",
+                    )
+                }
+            }
+            """.trimIndent()
+        val dynamicDependencyEvidence = listOf("example:plus", "example:latest", "example:range", "example:rich")
+        val dynamicDependencyFixture = GradleFixture(
+            settings =
+                """
+                rootProject.name = "dependency-policy-fixture"
+                include(":child")
+                """.trimIndent(),
+            rootBuild =
+                """
+                buildscript {
+                    dependencies {
+                        constraints {
+                            add("classpath", "example:rich") {
+                                version {
+                                    strictly("[3,4)")
+                                    prefer("latest.integration")
+                                }
+                            }
+                        }
+                    }
+                }
+
+                configurations.create("dependencyPolicyRootProbe")
+                configurations.create("dependencyPolicyConstraintProbe")
+                dependencies {
+                    add("dependencyPolicyRootProbe", "example:plus:1.+")
+                    constraints {
+                        add("dependencyPolicyConstraintProbe", "example:range:[1,2)")
+                    }
+                }
+                """.trimIndent(),
+            childBuild =
+                """
+                configurations.create("dependencyPolicyChildProbe")
+                dependencies.add("dependencyPolicyChildProbe", "example:latest:latest.release")
+                """.trimIndent(),
+        )
         val catalogAdversaries = listOf(
             CatalogAdversary("string library declaration") {
                 it.replace("[libraries]\n", "[libraries]\nbypass-string = \"example:artifact:1.+\"\n")
