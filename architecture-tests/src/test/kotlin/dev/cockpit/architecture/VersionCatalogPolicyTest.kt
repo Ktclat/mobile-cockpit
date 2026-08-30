@@ -17,6 +17,26 @@ import kotlin.io.path.exists
 
 class VersionCatalogPolicyTest {
     @Test
+    fun pinsRoomAndProviderTransportFoundationWithVerifiedArtifacts() {
+        val root = projectRoot()
+        val catalog = parseCatalog(Files.readString(root.resolve("gradle/libs.versions.toml")))
+        val aliasesByName = catalog.aliases.associateBy(Alias::name)
+        val verifiedComponents = verifiedComponents(root.resolve("gradle/verification-metadata.xml"))
+
+        foundationVersions.forEach { (name, expectedVersion) ->
+            assertEquals(expectedVersion, catalog.versions[name], "Foundation version '$name' must remain frozen.")
+        }
+        foundationAliases.forEach { (name, expectedCoordinate) ->
+            val alias = aliasesByName[name]
+            assertEquals(expectedCoordinate, alias?.coordinate, "Foundation alias '$name' must remain frozen.")
+            assertTrue(
+                expectedCoordinate in verifiedComponents,
+                "Foundation alias '$name' must resolve only through complete SHA-256 verification metadata.",
+            )
+        }
+    }
+
+    @Test
     fun rejectsDynamicAndUnverifiedDependencies() {
         val root = projectRoot()
         val catalog = root.resolve("gradle/libs.versions.toml")
@@ -767,13 +787,26 @@ class VersionCatalogPolicyTest {
             "targetSdk" to "36",
             "composeBom" to "2026.06.00",
             "junit" to "5.14.3",
+            "room" to "3.0.2",
+            "ksp" to "2.3.10",
+            "okhttp" to "5.5.0",
         )
         val frozenAliases = mapOf(
             "android-application" to "com.android.application:com.android.application.gradle.plugin:9.3.0",
             "android-library" to "com.android.library:com.android.library.gradle.plugin:9.3.0",
             "compose-compiler" to "org.jetbrains.kotlin.plugin.compose:org.jetbrains.kotlin.plugin.compose.gradle.plugin:2.4.10",
             "compose-bom" to "androidx.compose:compose-bom:2026.06.00",
+            "room-runtime" to "androidx.room3:room3-runtime:3.0.2",
+            "room-compiler" to "androidx.room3:room3-compiler:3.0.2",
+            "room-testing" to "androidx.room3:room3-testing:3.0.2",
+            "okhttp" to "com.squareup.okhttp3:okhttp:5.5.0",
+            "mockwebserver" to "com.squareup.okhttp3:mockwebserver3:5.5.0",
+            "ksp" to "com.google.devtools.ksp:com.google.devtools.ksp.gradle.plugin:2.3.10",
         )
+        val foundationVersions = frozenVersions.filterKeys { it in setOf("room", "ksp", "okhttp") }
+        val foundationAliases = frozenAliases.filterKeys {
+            it in setOf("room-runtime", "room-compiler", "room-testing", "okhttp", "mockwebserver", "ksp")
+        }
         val canonicalVersionDeclaration = Regex("^([\\w.-]+)\\s*=\\s*\\\"([^\\\"]+)\\\"$")
         val canonicalLibraryDeclaration =
             Regex("^([\\w.-]+)\\s*=\\s*\\{\\s*module\\s*=\\s*\\\"([^\\\"]+)\\\",\\s*version\\.ref\\s*=\\s*\\\"([^\\\"]+)\\\"\\s*}$")
