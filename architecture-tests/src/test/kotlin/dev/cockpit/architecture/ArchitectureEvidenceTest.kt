@@ -4,10 +4,79 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.TimeUnit
 import kotlin.io.path.exists
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
 
 class ArchitectureEvidenceTest {
+    @Test
+    fun rejectsCommentedWorkflowTriggers() {
+        assertEvidenceRejects(".github/workflows/android.yml") {
+            it.replace("on:\n  push:\n  pull_request:", "# on:\n#   push:\n#   pull_request:")
+        }
+    }
+
+    @Test
+    fun rejectsEchoInsteadOfWorkflowGradleExecution() {
+        assertEvidenceRejects(".github/workflows/android.yml") {
+            it.replace(
+                "run: ./gradlew test verifyArchitecture :app:assembleDebug lint",
+                "run: echo \"./gradlew test verifyArchitecture :app:assembleDebug lint\"",
+            )
+        }
+    }
+
+    @Test
+    fun rejectsWorkflowSetupJavaValuesUnderAnUnrelatedStep() {
+        assertEvidenceRejects(".github/workflows/android.yml") {
+            it.replace(
+                "      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961\n        with:",
+                "      - name: unrelated step\n        with:\n          distribution: temurin\n          java-version: '17'\n          cache: gradle\n          check-latest: false\n      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961\n        with:",
+            )
+        }
+    }
+
+    @Test
+    fun rejectsAmbiguousDuplicateSetupJavaDeclaration() {
+        assertEvidenceRejects(".github/workflows/android.yml") {
+            it.replace("          distribution: temurin", "          distribution: temurin\n          distribution: temurin")
+        }
+    }
+
+    @Test
+    fun rejectsDetektValuesOutsideTheirRequiredSections() {
+        assertEvidenceRejects("config/detekt/detekt.yml") {
+            """
+            build:
+              validation: true
+            config:
+              maxIssues: 0
+            """.trimIndent() + "\n"
+        }
+    }
+
+    @Test
+    fun reapsTimedOutEvidenceProcessWrapperAndChild() {
+        val pidFile = Files.createTempFile("cockpit-evidence-process-", ".pids")
+        try {
+            val result = runCatching {
+                runEvidenceProcess(timeoutWrapperCommand(pidFile), projectRoot(), 1, TimeUnit.SECONDS)
+            }
+
+            val pids = Files.readString(pidFile).trim().split(',').map(String::toLong)
+            assertTrue(pids.size == 2, "The wrapper must record both its own PID and its child's PID")
+            assertTrue(pids.none(::isProcessAlive), "Timed-out evidence processes must leave no wrapper or child alive")
+            assertTrue(result.isSuccess, "Evidence output must be consumed and deleted only after process cleanup")
+            assertFalse(result.getOrThrow().completed, "The long-lived wrapper must take the timeout path")
+        } finally {
+            if (Files.exists(pidFile)) {
+                Files.readString(pidFile).trim().split(',').mapNotNull(String::toLongOrNull).forEach(::terminateForTest)
+            }
+            Files.deleteIfExists(pidFile)
+        }
+    }
+
     @Test
     fun requiresAcceptedFoundationAdrsAndCiTasks() {
         val root = projectRoot()
@@ -36,25 +105,7 @@ class ArchitectureEvidenceTest {
         if (!workflow.exists()) {
             failures += "Missing CI workflow: .github/workflows/android.yml"
         } else {
-            val content = Files.readString(workflow)
-            requireContains(content, "push:", "CI workflow must run on push", failures)
-            requireContains(content, "pull_request:", "CI workflow must run on pull_request", failures)
-            requireAbsent(content, "pull_request_target", "CI workflow must never use pull_request_target", failures)
-            requireExactlyOne(content, Regex("(?m)^permissions:\\s*\\r?$"), "CI workflow must have one top-level permissions declaration", failures)
-            requireExactlyOne(content, Regex("(?m)^\\s+contents: read\\s*$"), "CI workflow permissions must be read-only (`contents: read`)", failures)
-            requireExactlyOne(content, Regex("(?m)^\\s+timeout-minutes: [1-9]\\d*\\s*$"), "CI workflow must set one finite job timeout", failures)
-            requireExactlyOne(content, Regex("(?m)^\\s*-?\\s*uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\\s*$"), "CI workflow must pin actions/checkout", failures)
-            requireExactlyOne(content, Regex("(?m)^\\s*-?\\s*uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961\\s*$"), "CI workflow must pin actions/setup-java", failures)
-            requireContains(content, "distribution: temurin", "CI workflow must select Temurin", failures)
-            requireContains(content, "java-version: '17'", "CI workflow must select Java 17", failures)
-            requireContains(content, "cache: gradle", "CI workflow must use the permitted Gradle cache", failures)
-            requireContains(content, "check-latest: false", "CI workflow must disable check-latest", failures)
-            requireContains(content, "platforms;android-36", "CI workflow must install Android API 36", failures)
-            requireContains(content, "build-tools;36.0.0", "CI workflow must install Android build-tools 36.0.0", failures)
-            requireContains(content, "./gradlew test verifyArchitecture :app:assembleDebug lint", "CI workflow must execute the required wrapper tasks", failures)
-            listOf("continue-on-error", "|| true", "--continue").forEach { prohibited ->
-                requireAbsent(content, prohibited, "CI workflow Gradle step must be fail-fast and not contain `$prohibited`", failures)
-            }
+            requireCanonical(Files.readString(workflow), canonicalWorkflow, "CI workflow must use the one supported fail-closed foundation structure", failures)
         }
 
         val rootBuild = root.resolve("build.gradle.kts")
@@ -70,9 +121,7 @@ class ArchitectureEvidenceTest {
         if (!detekt.exists()) {
             failures += "Missing fail-closed Detekt configuration: config/detekt/detekt.yml"
         } else {
-            val content = Files.readString(detekt)
-            requireContains(content, "maxIssues: 0", "Detekt configuration must fail closed with build.maxIssues: 0", failures)
-            requireContains(content, "validation: true", "Detekt configuration must enable validation", failures)
+            requireCanonical(Files.readString(detekt), canonicalDetektConfig, "Detekt configuration must keep maxIssues and validation under their required sections", failures)
         }
 
         val gradlewMode = gitMode(root, "gradlew")
@@ -90,34 +139,108 @@ class ArchitectureEvidenceTest {
         } else {
             listOf("./gradlew", "verifyArchitecture", "--dry-run", "--no-daemon", "--console=plain")
         }
-        val output = Files.createTempFile("cockpit-verify-architecture-", ".txt")
+        val result = runEvidenceProcess(command, root, 60, TimeUnit.SECONDS)
+        return if (result.completed && result.exitCode == 0 && result.output.contains(":architecture-tests:test")) {
+            emptyList()
+        } else {
+            listOf("verifyArchitecture must resolve as a Gradle task depending on :architecture-tests:test: ${result.output}")
+        }
+    }
+
+    private fun gitMode(root: Path, path: String): String? {
+        val result = runEvidenceProcess(listOf("git", "ls-files", "--stage", "--", path), root, 10, TimeUnit.SECONDS)
+        if (!result.completed || result.exitCode != 0) return null
+        return result.output.lineSequence().firstOrNull()?.substringBefore(' ')
+    }
+
+    private fun runEvidenceProcess(
+        command: List<String>,
+        root: Path,
+        timeout: Long,
+        unit: TimeUnit,
+    ): EvidenceProcessResult {
+        val output = Files.createTempFile("cockpit-evidence-process-", ".txt")
+        var outputCanBeDeleted = false
         try {
             val process = ProcessBuilder(command)
                 .directory(root.toFile())
                 .redirectErrorStream(true)
                 .redirectOutput(output.toFile())
                 .start()
-            val completed = process.waitFor(60, TimeUnit.SECONDS)
-            if (!completed) process.destroyForcibly()
-            val result = Files.readString(output)
-            return if (completed && process.exitValue() == 0 && result.contains(":architecture-tests:test")) {
-                emptyList()
-            } else {
-                listOf("verifyArchitecture must resolve as a Gradle task depending on :architecture-tests:test: $result")
+            val completed = process.waitFor(timeout, unit)
+            if (!completed && !terminateAndReapProcessTree(process)) {
+                return EvidenceProcessResult(
+                    completed = false,
+                    exitCode = null,
+                    output = "Evidence process tree did not terminate within the bounded cleanup timeout",
+                )
             }
+            outputCanBeDeleted = true
+            return EvidenceProcessResult(
+                completed = completed,
+                exitCode = if (completed) process.exitValue() else null,
+                output = Files.readString(output),
+            )
         } finally {
-            Files.deleteIfExists(output)
+            if (outputCanBeDeleted) Files.deleteIfExists(output)
         }
     }
 
-    private fun gitMode(root: Path, path: String): String? {
-        val process = ProcessBuilder("git", "ls-files", "--stage", "--", path)
-            .directory(root.toFile())
-            .redirectErrorStream(true)
-            .start()
-        val completed = process.waitFor(10, TimeUnit.SECONDS)
-        if (!completed || process.exitValue() != 0) return null
-        return process.inputStream.bufferedReader().readLine()?.substringBefore(' ')
+    private fun terminateAndReapProcessTree(process: Process): Boolean {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(processCleanupTimeoutSeconds)
+        val root = process.toHandle()
+        val processes = linkedSetOf<ProcessHandle>()
+        processes += root.descendants().toList()
+        processes += root
+        root.destroyForcibly()
+        processes += root.descendants().toList()
+        processes.toList().asReversed().forEach { handle ->
+            if (handle.isAlive) handle.destroyForcibly()
+        }
+        val rootReaped = waitForReap(process, deadline)
+        return rootReaped && processes.all { handle -> waitForExit(handle, deadline) }
+    }
+
+    private fun waitForReap(process: Process, deadline: Long): Boolean {
+        val remaining = deadline - System.nanoTime()
+        return remaining > 0 && process.waitFor(remaining, TimeUnit.NANOSECONDS)
+    }
+
+    private fun waitForExit(process: ProcessHandle, deadline: Long): Boolean {
+        if (!process.isAlive) return true
+        val remaining = deadline - System.nanoTime()
+        if (remaining <= 0) return false
+        return try {
+            process.onExit().get(remaining, TimeUnit.NANOSECONDS)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun timeoutWrapperCommand(pidFile: Path): List<String> =
+        if (System.getProperty("os.name").startsWith("Windows")) {
+            listOf(
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "${'$'}child = Start-Process powershell -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 30' -PassThru; Set-Content -NoNewline -LiteralPath '${pidFile.toAbsolutePath()}' -Value (${'$'}PID.ToString() + ',' + ${'$'}child.Id.ToString()); Start-Sleep -Seconds 30",
+            )
+        } else {
+            listOf(
+                "sh",
+                "-c",
+                "(sleep 30) & child=\$!; printf '%s,%s\\n' \"\$\$\" \"\$child\" > '${pidFile.toAbsolutePath()}'; sleep 30",
+            )
+        }
+
+    private fun isProcessAlive(pid: Long): Boolean = ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false)
+
+    private fun terminateForTest(pid: Long) {
+        ProcessHandle.of(pid).ifPresent { process ->
+            process.destroyForcibly()
+            process.onExit().get(2, TimeUnit.SECONDS)
+        }
     }
 
     private fun requireContains(content: String, value: String, message: String, failures: MutableList<String>) {
@@ -134,8 +257,24 @@ class ArchitectureEvidenceTest {
         if (content.contains(value)) failures += message
     }
 
+    private fun requireCanonical(content: String, canonical: String, message: String, failures: MutableList<String>) {
+        val normalized = content.replace("\r\n", "\n").trimEnd() + "\n"
+        if (normalized != canonical) failures += message
+    }
+
     private fun requireExactlyOne(content: String, declaration: Regex, message: String, failures: MutableList<String>) {
         if (declaration.findAll(content).count() != 1) failures += message
+    }
+
+    private fun assertEvidenceRejects(path: String, mutate: (String) -> String) {
+        val file = projectRoot().resolve(path)
+        val original = Files.readString(file)
+        try {
+            Files.writeString(file, mutate(original))
+            assertThrows(AssertionError::class.java) { requiresAcceptedFoundationAdrsAndCiTasks() }
+        } finally {
+            Files.writeString(file, original)
+        }
     }
 
     private fun projectRoot(): Path =
@@ -148,13 +287,54 @@ class ArchitectureEvidenceTest {
         val decisionTerms: List<String>,
     )
 
+    private data class EvidenceProcessResult(
+        val completed: Boolean,
+        val exitCode: Int?,
+        val output: String,
+    )
+
     private companion object {
         const val architectureSource = "docs/superpowers/specs/2026-08-30-system-architecture-v0.1.md"
+        const val processCleanupTimeoutSeconds = 5L
+        val canonicalWorkflow = """
+            name: Android foundation
+
+            on:
+              push:
+              pull_request:
+
+            permissions:
+              contents: read
+
+            jobs:
+              foundation:
+                runs-on: ubuntu-24.04
+                timeout-minutes: 30
+                steps:
+                  - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+                  - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+                    with:
+                      distribution: temurin
+                      java-version: '17'
+                      cache: gradle
+                      check-latest: false
+                  - name: Install Android SDK packages
+                    run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+                  - name: Verify foundation
+                    run: ./gradlew test verifyArchitecture :app:assembleDebug lint
+        """.trimIndent() + "\n"
+        val canonicalDetektConfig = """
+            build:
+              maxIssues: 0
+
+            config:
+              validation: true
+        """.trimIndent() + "\n"
         val foundationAdrs = listOf(
             AdrEvidence("docs/adr/ADR-001-module-boundaries.md", listOf("Section 5", "Section 30"), listOf("modular monolith", "Ports/Adapters", "module dependency boundaries")),
             AdrEvidence("docs/adr/ADR-002-single-writer-runtime.md", listOf("Section 7", "Section 9", "Section 10", "Section 30"), listOf("RunCoordinator", "sole Run-state writer", "long I/O", "version/attempt validation")),
             AdrEvidence("docs/adr/ADR-003-persistence-event-ledger.md", listOf("Section 12", "Section 13", "Section 30"), listOf("authoritative relational facts", "append-only Runtime Event Ledger", "encrypted content/evidence", "rebuildable projections")),
-            AdrEvidence("docs/adr/ADR-004-projection-boundary.md", listOf("Section 12.4", "Section 13.4", "Section 14", "Section 30"), listOf("global event ordinal", "per-Run sequence", "expected version", "committed facts", "never becoming authority")),
+            AdrEvidence("docs/adr/ADR-004-projection-boundary.md", listOf("Section 12.4", "Section 13.4", "Section 14", "Section 30"), listOf("global event ordinal", "per-Run sequence", "expected version", "committed facts", "never become authority")),
         )
     }
 }

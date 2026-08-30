@@ -14,7 +14,7 @@ The Approved/Frozen System Architecture remains authoritative. If downstream wor
 
 ## Decision
 
-Facts have a global event ordinal, per-Run sequence, and expected version. Projections consume committed facts and never becoming authority.
+Facts have a global event ordinal, per-Run sequence, and expected version. Projections consume committed facts and never become authority.
 
 ## Consequences
 
