@@ -124,6 +124,24 @@ class ArchitectureEvidenceTest {
     }
 
     @Test
+    fun reapsCapturedChildWhenWrapperExitsBeforeFinally() {
+        val pidFile = Files.createTempFile("cockpit-evidence-process-wrapper-exit-", ".pids")
+        val output = Files.createTempFile("cockpit-evidence-process-wrapper-exit-", ".txt")
+        try {
+            runEvidenceProcess(timeoutWrapperCommand(pidFile), projectRoot(), 30, TimeUnit.SECONDS, output) { wrapper ->
+                awaitPidFile(pidFile)
+                wrapper.destroyForcibly()
+            }
+            assertTrue(awaitPidFile(pidFile).none(::isProcessAlive), "A dead wrapper must not hide a live captured child")
+            assertFalse(Files.exists(output), "Output must be deleted only after the captured tree is reaped")
+        } finally {
+            if (Files.exists(pidFile)) awaitPidFile(pidFile).forEach(::terminateForTest)
+            Files.deleteIfExists(pidFile)
+            Files.deleteIfExists(output)
+        }
+    }
+
+    @Test
     fun pureMutationValidatorsLeaveTrackedEvidenceUnchanged() {
         val root = projectRoot()
         val workflow = root.resolve(".github/workflows/android.yml")
@@ -223,6 +241,7 @@ class ArchitectureEvidenceTest {
         afterStart: (Process) -> Unit = {},
     ): EvidenceProcessResult {
         var process: Process? = null
+        var capturedTree = emptyList<ProcessHandle>()
         var interrupted = false
         try {
             val started = ProcessBuilder(command)
@@ -232,8 +251,9 @@ class ArchitectureEvidenceTest {
                 .start()
             process = started
             afterStart(started)
+            capturedTree = captureProcessTree(started)
             val completed = started.waitFor(timeout, unit)
-            if (!completed && !terminateAndReapProcessTree(started)) {
+            if (!completed && !terminateAndReapProcessTree(started, capturedTree)) {
                 throw EvidenceProcessCleanupException("Evidence process tree did not terminate within the bounded cleanup timeout")
             }
             return EvidenceProcessResult(
@@ -245,13 +265,11 @@ class ArchitectureEvidenceTest {
             interrupted = true
             throw error
         } finally {
-            val cleanupSucceeded = process?.let { started ->
-                if (started.isAlive) terminateAndReapProcessTree(started) else true
-            } ?: true
+            val cleanupSucceeded = process?.let { started -> terminateAndReapProcessTree(started, capturedTree) } ?: true
             if (cleanupSucceeded) {
                 Files.deleteIfExists(output)
             } else {
-                scheduleDeferredOutputDeletion(output, process)
+                scheduleDeferredOutputDeletion(output, capturedTree)
                 if (interrupted) Thread.currentThread().interrupt()
                 throw EvidenceProcessCleanupException("Evidence process cleanup failed; deferred output deletion was scheduled")
             }
@@ -259,18 +277,16 @@ class ArchitectureEvidenceTest {
         }
     }
 
-    private fun terminateAndReapProcessTree(process: Process): Boolean {
+    private fun captureProcessTree(process: Process): List<ProcessHandle> =
+        (process.toHandle().descendants().toList() + process.toHandle()).distinct()
+
+    private fun terminateAndReapProcessTree(process: Process, capturedTree: List<ProcessHandle>): Boolean {
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(processCleanupTimeoutSeconds)
-        val root = process.toHandle()
-        val processes = linkedSetOf<ProcessHandle>()
-        processes += root.descendants().toList()
-        processes += root
-        root.destroyForcibly()
-        processes += root.descendants().toList()
+        val processes = capturedTree
         processes.toList().asReversed().forEach { handle ->
             if (handle.isAlive) handle.destroyForcibly()
         }
-        val rootReaped = waitForReap(process, deadline)
+        val rootReaped = !process.isAlive || waitForReap(process, deadline)
         return rootReaped && processes.all { handle -> waitForExit(handle, deadline) }
     }
 
@@ -291,9 +307,8 @@ class ArchitectureEvidenceTest {
         }
     }
 
-    private fun scheduleDeferredOutputDeletion(output: Path, process: Process) {
-        val handles = (process.toHandle().descendants().toList() + process.toHandle()).distinct()
-        CompletableFuture.allOf(*handles.map(ProcessHandle::onExit).toTypedArray()).whenComplete { _, _ ->
+    private fun scheduleDeferredOutputDeletion(output: Path, capturedTree: List<ProcessHandle>) {
+        CompletableFuture.allOf(*capturedTree.map(ProcessHandle::onExit).toTypedArray()).whenComplete { _, _ ->
             runCatching { Files.deleteIfExists(output) }
         }
     }
