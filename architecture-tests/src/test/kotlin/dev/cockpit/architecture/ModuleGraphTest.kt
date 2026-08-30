@@ -5,6 +5,7 @@ import java.nio.file.Path
 import java.util.concurrent.TimeUnit
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Assertions.fail
 import org.junit.jupiter.api.Test
@@ -49,6 +50,18 @@ class ModuleGraphTest {
             graph.productionEdges.filter { (source, _) -> source == ":app" }.toSet(),
             ":app must remain packaging-only.",
         )
+        assertTrue(
+            requiredAppProductionCompileClasspaths.all { it in graph.appProductionCompileVisibility },
+            ":app must expose every required production compile classpath to architecture verification: " +
+                "${graph.appProductionCompileVisibility.keys}",
+        )
+        graph.appProductionCompileVisibility.forEach { (configuration, visibleProjects) ->
+            assertEquals(
+                expectedAppCompileVisibility,
+                visibleProjects,
+                ":app $configuration must expose only the frozen packaging-boundary projects.",
+            )
+        }
 
         val reachableFromPresentation = graph.reachableFrom(":presentation")
         setOf(
@@ -137,6 +150,59 @@ class ModuleGraphTest {
         assertGraphRejects(graph)
     }
 
+    @Test
+    fun rejectsAllowedAdapterPromotedOntoAppCompileClasspath() {
+        val graph = GradleModuleGraph.read(
+            projectRoot(),
+            """
+            gradle.projectsEvaluated {
+                def platform = gradle.rootProject.project(":platform:android")
+                platform.dependencies.add(
+                    "api",
+                    platform.dependencies.project(path: ":integration:ssh"),
+                )
+            }
+            """.trimIndent(),
+        )
+        assertEquals(
+            expectedEdges,
+            graph.productionEdges,
+            "The API-leak adversary must preserve the frozen declaration-edge set.",
+        )
+        requiredAppProductionCompileClasspaths.forEach { configuration ->
+            assertTrue(
+                ":integration:ssh" in graph.appProductionCompileVisibility.getValue(configuration),
+                "The resolved $configuration must prove that the promoted adapter became compile-visible.",
+            )
+        }
+        assertGraphRejects(graph)
+    }
+
+    @Test
+    fun failsClosedWhenAppProductionCompileClasspathCannotResolve() {
+        val failure = assertThrows(AssertionError::class.java) {
+            GradleModuleGraph.read(
+                projectRoot(),
+                """
+                gradle.projectsEvaluated {
+                    def app = gradle.rootProject.project(":app")
+                    app.configurations.matching {
+                        it.name == "debugCompileClasspath"
+                    }.configureEach { configuration ->
+                        configuration.incoming.beforeResolve {
+                            throw new GradleException("synthetic production compile resolution failure")
+                        }
+                    }
+                }
+                """.trimIndent(),
+            )
+        }
+        assertTrue(
+            failure.message.orEmpty().contains("synthetic production compile resolution failure"),
+            "Resolution failure evidence must survive the fail-closed snapshot boundary: ${failure.message}",
+        )
+    }
+
     private fun projectRoot(): Path =
         generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath()) { it.parent }
             .first { it.resolve(".git").exists() }
@@ -179,6 +245,7 @@ class ModuleGraphTest {
         val productionEdges: Set<Edge>,
         val effectiveProductionClasspathEdges: Set<Edge>,
         val nonTestStructuralEdges: Set<Edge>,
+        val appProductionCompileVisibility: Map<String, Set<String>>,
     ) {
         fun reachableFrom(source: String): Set<String> {
             val visited = mutableSetOf<String>()
@@ -220,6 +287,7 @@ class ModuleGraphTest {
                     productionEdges,
                     effectiveProductionClasspathEdges,
                     nonTestStructuralEdges,
+                    evaluatedModel.appProductionCompileVisibility,
                 )
             }
 
@@ -270,6 +338,7 @@ class ModuleGraphTest {
                 val projects = mutableSetOf<String>()
                 val dependencies = mutableSetOf<EvaluatedProjectDependency>()
                 val effectiveProductionClasspathDependencies = mutableSetOf<EvaluatedProjectDependency>()
+                val appProductionCompileVisibility = mutableMapOf<String, MutableSet<String>>()
                 output.lineSequence().forEach { line ->
                     when {
                         line.startsWith(projectMarker) -> projects += line.removePrefix(projectMarker)
@@ -284,10 +353,25 @@ class ModuleGraphTest {
                             effectiveProductionClasspathDependencies +=
                                 EvaluatedProjectDependency(fields[0], fields[1], fields[2])
                         }
+                        line.startsWith(appCompileClasspathMarker) -> {
+                            val configuration = line.removePrefix(appCompileClasspathMarker)
+                            assertTrue(configuration.isNotBlank(), "Malformed app production compile classpath: $line")
+                            appProductionCompileVisibility.getOrPut(configuration) { mutableSetOf() }
+                        }
+                        line.startsWith(appCompileProjectMarker) -> {
+                            val fields = line.removePrefix(appCompileProjectMarker).split('|')
+                            assertEquals(2, fields.size, "Malformed app compile-visible project: $line")
+                            appProductionCompileVisibility.getOrPut(fields[0]) { mutableSetOf() } += fields[1]
+                        }
                     }
                 }
                 assertTrue(projects.isNotEmpty(), "The evaluated Gradle module graph produced no project paths.\n$output")
-                return EvaluatedModel(projects, dependencies, effectiveProductionClasspathDependencies)
+                return EvaluatedModel(
+                    projects,
+                    dependencies,
+                    effectiveProductionClasspathDependencies,
+                    appProductionCompileVisibility.mapValues { (_, projects) -> projects.toSet() },
+                )
             }
 
             private fun isExplicitTestOnlyConfiguration(name: String): Boolean =
@@ -297,6 +381,8 @@ class ModuleGraphTest {
             private const val projectMarker = "COCKPIT_MODULE_PROJECT="
             private const val dependencyMarker = "COCKPIT_MODULE_EDGE="
             private const val effectiveDependencyMarker = "COCKPIT_MODULE_EFFECTIVE_PRODUCTION_EDGE="
+            private const val appCompileClasspathMarker = "COCKPIT_APP_PRODUCTION_COMPILE_CLASSPATH="
+            private const val appCompileProjectMarker = "COCKPIT_APP_COMPILE_PROJECT="
             private val explicitTestOnlyConfiguration = Regex(
                 """(?:(?:test|androidTest|testFixtures)|(?:[a-z][A-Za-z0-9]*)?(?:UnitTest|AndroidTest))(?:Api|Implementation|CompileOnly|RuntimeOnly|CompileClasspath|RuntimeClasspath|AnnotationProcessor|Kapt|Ksp)""",
             )
@@ -330,6 +416,43 @@ class ModuleGraphTest {
                                     }
                                 }
                             }
+                            def app = root.project(":app")
+                            app.configurations.findAll { configuration ->
+                                (configuration.name == "compileClasspath" ||
+                                    configuration.name.endsWith("CompileClasspath")) &&
+                                    !explicitTestOnlyConfiguration(configuration.name)
+                            }.sort { it.name }.each { configuration ->
+                                println("COCKPIT_APP_PRODUCTION_COMPILE_CLASSPATH=" + configuration.name)
+                                try {
+                                    def resolution = configuration.incoming.resolutionResult
+                                    def unresolved = resolution.allDependencies.findAll { dependency ->
+                                        dependency instanceof org.gradle.api.artifacts.result.UnresolvedDependencyResult
+                                    }
+                                    if (!unresolved.isEmpty()) {
+                                        throw new GradleException(
+                                            "Unresolved dependencies: " +
+                                                unresolved.collect { it.attempted.displayName }.sort().join(", "),
+                                        )
+                                    }
+                                    resolution.allComponents.collect { component -> component.id }
+                                        .findAll { identifier ->
+                                            identifier instanceof org.gradle.api.artifacts.component.ProjectComponentIdentifier &&
+                                                identifier.projectPath != app.path
+                                        }
+                                        .collect { identifier -> identifier.projectPath }
+                                        .toSet()
+                                        .sort()
+                                        .each { projectPath ->
+                                            println("COCKPIT_APP_COMPILE_PROJECT=" + configuration.name + "|" + projectPath)
+                                        }
+                                } catch (Exception failure) {
+                                    throw new GradleException(
+                                        "Unable to resolve :app production compile classpath " + configuration.name +
+                                            ": " + failure.message,
+                                        failure,
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -340,6 +463,7 @@ class ModuleGraphTest {
             val projects: Set<String>,
             val dependencies: Set<EvaluatedProjectDependency>,
             val effectiveProductionClasspathDependencies: Set<EvaluatedProjectDependency>,
+            val appProductionCompileVisibility: Map<String, Set<String>>,
         )
 
         private data class EvaluatedProjectDependency(
@@ -397,6 +521,16 @@ class ModuleGraphTest {
             ":security-tests",
             ":spikes:ssh-transport",
             ":test-support",
+        )
+
+        val requiredAppProductionCompileClasspaths = setOf(
+            "debugCompileClasspath",
+            "releaseCompileClasspath",
+        )
+
+        val expectedAppCompileVisibility = setOf(
+            ":presentation",
+            ":platform:android",
         )
 
         val expectedEdges = setOf(
