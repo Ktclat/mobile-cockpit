@@ -136,19 +136,54 @@ class VersionCatalogPolicyTest {
         )
     }
 
+    @Test
+    fun evaluatedGradleAuthorityRejectsDependenciesAddedAfterConfigurationListeners() {
+        val result = runEvaluatedDependencyPolicy(lateInitScript = lateDynamicDependencyInjection)
+        val missingEvidence = lateDynamicDependencyEvidence.filterNot(result.output::contains)
+
+        assertFalse(
+            result.completed && result.exitCode == 0,
+            "Evaluated Gradle policy must reject dependencies added by later projectsEvaluated and " +
+                "taskGraph.whenReady listeners.\n${result.output}",
+        )
+        assertTrue(
+            missingEvidence.isEmpty(),
+            "Late dependency-policy failure must identify every injected declaration; missing $missingEvidence.\n${result.output}",
+        )
+    }
+
+    @Test
+    fun evaluatedGradleAuthorityFailsClosedOnReservedTaskNameCollision() {
+        val result = runEvaluatedDependencyPolicy(taskCollisionFixture)
+
+        assertFalse(
+            result.completed && result.exitCode == 0,
+            "A build that preclaims the reserved dependency-policy task name must fail closed.\n${result.output}",
+        )
+        assertTrue(
+            result.output.contains("COCKPIT_DEPENDENCY_POLICY_TASK_COLLISION=cockpitVerifyEvaluatedDependencyPolicy"),
+            "Task collision failure must carry deterministic policy evidence.\n${result.output}",
+        )
+    }
+
     private fun projectRoot(): Path =
         generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath()) { it.parent }
             .first { it.resolve(".git").exists() }
 
-    private fun runEvaluatedDependencyPolicy(fixture: GradleFixture? = null): GradleResult {
+    private fun runEvaluatedDependencyPolicy(
+        fixture: GradleFixture? = null,
+        lateInitScript: String? = null,
+    ): GradleResult {
         val root = projectRoot()
         val tempDirectory = Files.createTempDirectory("cockpit-dependency-policy-")
         val fixtureRoot = fixture?.let { tempDirectory.resolve("fixture") }
         val policyScript = tempDirectory.resolve("dependency-policy.gradle")
+        val lateScript = lateInitScript?.let { tempDirectory.resolve("late-mutation.gradle") }
         val outputFile = tempDirectory.resolve("output.txt")
         var process: Process? = null
         try {
             Files.writeString(policyScript, evaluatedDependencyPolicyInitScript)
+            if (lateScript != null) Files.writeString(lateScript, lateInitScript)
             if (fixtureRoot != null) {
                 Files.createDirectories(fixtureRoot.resolve("child"))
                 Files.writeString(fixtureRoot.resolve("settings.gradle"), fixture.settings)
@@ -171,8 +206,9 @@ class VersionCatalogPolicyTest {
                         policyScript.toString(),
                     ),
                 )
+                if (lateScript != null) addAll(listOf("-I", lateScript.toString()))
                 if (fixtureRoot != null) addAll(listOf("-p", fixtureRoot.toString()))
-                add("help")
+                add(evaluatedDependencyPolicyTaskName)
             }
             val started = ProcessBuilder(command)
                 .directory(root.toFile())
@@ -443,74 +479,110 @@ class VersionCatalogPolicyTest {
     private enum class CatalogSection { VERSIONS, LIBRARIES, PLUGINS }
 
     private companion object {
+        const val evaluatedDependencyPolicyTaskName = "cockpitVerifyEvaluatedDependencyPolicy"
         val evaluatedDependencyPolicyInitScript =
             """
             gradle.projectsEvaluated {
-                def violations = []
-                def dynamicSelector = { selector ->
-                    if (selector == null) return false
-                    def value = selector.toString().trim()
-                    value.contains("+") ||
-                        value.contains("*") ||
-                        value ==~ /(?i).*latest\..*/ ||
-                        value ==~ /.*[\[\]()].*/
-                }
-                def inspectConstraint = { owner, scope, configuration, kind, group, name, constraint ->
-                    def selectors = [
-                        required: constraint.requiredVersion,
-                        strict: constraint.strictVersion,
-                        preferred: constraint.preferredVersion,
-                    ]
-                    if (constraint.hasProperty("branch") && constraint.branch != null) {
-                        selectors.branch = constraint.branch
-                    }
-                    selectors.findAll { label, value -> dynamicSelector(value) }.each { label, value ->
-                        violations.add(
-                            owner.path + "|" + scope + "|" + configuration.name + "|" + kind + "|" +
-                                group + ":" + name + "|" + label + "=" + value,
-                        )
-                    }
-                }
-                def inspectConfigurations = { owner, scope, configurations ->
-                    configurations.each { configuration ->
-                        configuration.dependencies.withType(org.gradle.api.artifacts.ExternalModuleDependency).each { dependency ->
-                            inspectConstraint(
-                                owner,
-                                scope,
-                                configuration,
-                                "dependency",
-                                dependency.group,
-                                dependency.name,
-                                dependency.versionConstraint,
-                            )
-                        }
-                        configuration.dependencyConstraints.each { constraint ->
-                            inspectConstraint(
-                                owner,
-                                scope,
-                                configuration,
-                                "constraint",
-                                constraint.group,
-                                constraint.name,
-                                constraint.versionConstraint,
-                            )
-                        }
-                    }
+                def root = gradle.rootProject
+                def policyTaskName = "$evaluatedDependencyPolicyTaskName"
+                if (root.tasks.findByName(policyTaskName) != null) {
+                    println("COCKPIT_DEPENDENCY_POLICY_TASK_COLLISION=" + policyTaskName)
+                    throw new GradleException("Reserved dependency-policy task already exists: " + policyTaskName)
                 }
 
-                gradle.rootProject.allprojects.each { candidate ->
-                    inspectConfigurations(candidate, "project", candidate.configurations)
-                    inspectConfigurations(candidate, "buildscript", candidate.buildscript.configurations)
-                }
-                if (!violations.isEmpty()) {
-                    violations.sort().each { println("COCKPIT_DYNAMIC_DEPENDENCY_POLICY=" + it) }
-                    throw new GradleException(
-                        "Dynamic external dependency declarations are forbidden; " + violations.size() + " violation(s).",
-                    )
+                root.tasks.register(policyTaskName) {
+                    group = "verification"
+                    description = "Rejects dynamic external dependency declarations in the final evaluated model."
+                    doLast {
+                        def violations = []
+                        def dynamicSelector = { selector ->
+                            if (selector == null) return false
+                            def value = selector.toString().trim()
+                            value.contains("+") ||
+                                value.contains("*") ||
+                                value ==~ /(?i).*latest\..*/ ||
+                                value ==~ /.*[\[\]()].*/
+                        }
+                        def inspectConstraint = { owner, scope, configuration, kind, group, name, constraint ->
+                            def selectors = [
+                                required: constraint.requiredVersion,
+                                strict: constraint.strictVersion,
+                                preferred: constraint.preferredVersion,
+                            ]
+                            if (constraint.hasProperty("branch") && constraint.branch != null) {
+                                selectors.branch = constraint.branch
+                            }
+                            selectors.findAll { label, value -> dynamicSelector(value) }.each { label, value ->
+                                violations.add(
+                                    owner.path + "|" + scope + "|" + configuration.name + "|" + kind + "|" +
+                                        group + ":" + name + "|" + label + "=" + value,
+                                )
+                            }
+                        }
+                        def inspectConfigurations = { owner, scope, configurations ->
+                            configurations.each { configuration ->
+                                configuration.dependencies.withType(org.gradle.api.artifacts.ExternalModuleDependency).each { dependency ->
+                                    inspectConstraint(
+                                        owner,
+                                        scope,
+                                        configuration,
+                                        "dependency",
+                                        dependency.group,
+                                        dependency.name,
+                                        dependency.versionConstraint,
+                                    )
+                                }
+                                configuration.dependencyConstraints.each { constraint ->
+                                    inspectConstraint(
+                                        owner,
+                                        scope,
+                                        configuration,
+                                        "constraint",
+                                        constraint.group,
+                                        constraint.name,
+                                        constraint.versionConstraint,
+                                    )
+                                }
+                            }
+                        }
+
+                        root.allprojects.each { candidate ->
+                            inspectConfigurations(candidate, "project", candidate.configurations)
+                            inspectConfigurations(candidate, "buildscript", candidate.buildscript.configurations)
+                        }
+                        if (!violations.isEmpty()) {
+                            violations.sort().each { println("COCKPIT_DYNAMIC_DEPENDENCY_POLICY=" + it) }
+                            throw new GradleException(
+                                "Dynamic external dependency declarations are forbidden; " + violations.size() + " violation(s).",
+                            )
+                        }
+                    }
                 }
             }
             """.trimIndent()
         val dynamicDependencyEvidence = listOf("example:plus", "example:latest", "example:range", "example:rich")
+        val lateDynamicDependencyEvidence = listOf("example:late-projects", "example:late-graph")
+        val lateDynamicDependencyInjection =
+            """
+            gradle.beforeProject { candidate ->
+                if (candidate.parent == null) {
+                    candidate.configurations.create("dependencyPolicyLateProjectsProbe")
+                    candidate.configurations.create("dependencyPolicyLateGraphProbe")
+                }
+            }
+            gradle.projectsEvaluated {
+                gradle.rootProject.dependencies.add(
+                    "dependencyPolicyLateProjectsProbe",
+                    "example:late-projects:7.+",
+                )
+            }
+            gradle.taskGraph.whenReady {
+                gradle.rootProject.dependencies.add(
+                    "dependencyPolicyLateGraphProbe",
+                    "example:late-graph:8.+",
+                )
+            }
+            """.trimIndent()
         val dynamicDependencyFixture = GradleFixture(
             settings =
                 """
@@ -546,6 +618,11 @@ class VersionCatalogPolicyTest {
                 configurations.create("dependencyPolicyChildProbe")
                 dependencies.add("dependencyPolicyChildProbe", "example:latest:latest.release")
                 """.trimIndent(),
+        )
+        val taskCollisionFixture = GradleFixture(
+            settings = "rootProject.name = \"dependency-policy-task-collision\"",
+            rootBuild = "tasks.register(\"cockpitVerifyEvaluatedDependencyPolicy\")",
+            childBuild = "",
         )
         val catalogAdversaries = listOf(
             CatalogAdversary("string library declaration") {
