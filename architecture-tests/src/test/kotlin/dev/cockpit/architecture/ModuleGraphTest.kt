@@ -66,14 +66,17 @@ class ModuleGraphTest {
 
     @Test
     fun rejectsWhitespaceProjectInclusion() {
-        val root = projectRoot()
-        val fixtureDirectory = root.resolve("architecture-graph-whitespace-fixture")
-        assertFalse(Files.exists(fixtureDirectory), "The whitespace-inclusion fixture directory must not already exist.")
-        Files.createDirectory(fixtureDirectory)
+        val fixtureDirectory = Files.createTempDirectory("cockpit-module-graph-project-")
         try {
-            assertGraphRejects(root.resolve("settings.gradle.kts")) {
-                "$it\ninclude (\":architecture-graph-whitespace-fixture\")\n"
-            }
+            assertGraphRejectsInitScript(
+                """
+                gradle.settingsEvaluated { settings ->
+                    settings.include (":architecture-graph-whitespace-fixture")
+                    settings.project(":architecture-graph-whitespace-fixture").projectDir =
+                        new File(${groovyString(fixtureDirectory.toString())})
+                }
+                """.trimIndent(),
+            )
         } finally {
             Files.deleteIfExists(fixtureDirectory)
         }
@@ -81,37 +84,92 @@ class ModuleGraphTest {
 
     @Test
     fun rejectsProductionDependencyInjectedFromRootBuildLogic() {
-        assertGraphRejects(projectRoot().resolve("build.gradle.kts")) {
-            "$it\n\nproject(\":presentation\") {\n    pluginManager.withPlugin(\"com.android.library\") {\n        dependencies.add(\n            \"implementation\",\n            dependencies.project(mapOf(\"path\" to \":spikes:ssh-transport\")),\n        )\n    }\n}\n"
-        }
+        assertGraphRejectsInitScript(
+            """
+            gradle.projectsEvaluated {
+                def source = gradle.rootProject.project(":presentation")
+                source.dependencies.add(
+                    "implementation",
+                    source.dependencies.project(path: ":spikes:ssh-transport"),
+                )
+            }
+            """.trimIndent(),
+        )
     }
 
     @Test
     fun rejectsNonTestProjectDependencyFromStructuralContainer() {
-        assertGraphRejects(projectRoot().resolve("build.gradle.kts")) {
-            "$it\n\nproject(\":core\") {\n    val architectureGraph = configurations.maybeCreate(\"architectureGraph\")\n    dependencies.add(\n        architectureGraph.name,\n        dependencies.project(mapOf(\"path\" to \":spikes:ssh-transport\")),\n    )\n}\n"
-        }
+        assertGraphRejectsInitScript(
+            """
+            gradle.projectsEvaluated {
+                def source = gradle.rootProject.project(":core")
+                def architectureGraph = source.configurations.maybeCreate("architectureGraph")
+                source.dependencies.add(
+                    architectureGraph.name,
+                    source.dependencies.project(path: ":spikes:ssh-transport"),
+                )
+            }
+            """.trimIndent(),
+        )
+    }
+
+    @Test
+    fun rejectsTestNamedConfigurationInheritedByProductionClasspath() {
+        val graph = GradleModuleGraph.read(
+            projectRoot(),
+            """
+            gradle.projectsEvaluated {
+                def source = gradle.rootProject.project(":app")
+                def hidden = source.configurations.maybeCreate("contestImplementation")
+                source.configurations.getByName("implementation").extendsFrom(hidden)
+                source.dependencies.add(
+                    hidden.name,
+                    source.dependencies.project(path: ":integration:ssh"),
+                )
+            }
+            """.trimIndent(),
+        )
+        val hiddenAdapter = Edge(":app", ":integration:ssh")
+        assertTrue(
+            hiddenAdapter in graph.effectiveProductionClasspathEdges,
+            "The evaluated authority must observe inherited project dependencies on the actual production classpath.",
+        )
+        assertGraphRejects(graph)
     }
 
     private fun projectRoot(): Path =
         generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath()) { it.parent }
             .first { it.resolve(".git").exists() }
 
-    private fun assertGraphRejects(file: Path, mutate: (String) -> String) {
-        val original = Files.readString(file)
-        try {
-            Files.writeString(file, mutate(original))
-            val graph = GradleModuleGraph.read(projectRoot())
-            try {
-                assertFrozenGraph(graph)
-            } catch (_: AssertionError) {
-                return
-            }
-            fail<Nothing>("Expected graph rejection, but evaluated production edges were ${graph.productionEdges}.")
-        } finally {
-            Files.writeString(file, original)
-        }
+    private fun assertGraphRejectsInitScript(initScript: String) {
+        val root = projectRoot()
+        val trackedSettings = root.resolve("settings.gradle.kts")
+        val trackedRootBuild = root.resolve("build.gradle.kts")
+        val settingsBefore = Files.readAllBytes(trackedSettings)
+        val rootBuildBefore = Files.readAllBytes(trackedRootBuild)
+        val graph = GradleModuleGraph.read(root, initScript)
+        assertTrue(
+            settingsBefore.contentEquals(Files.readAllBytes(trackedSettings)),
+            "Adversarial graph evaluation must not mutate tracked settings.gradle.kts.",
+        )
+        assertTrue(
+            rootBuildBefore.contentEquals(Files.readAllBytes(trackedRootBuild)),
+            "Adversarial graph evaluation must not mutate tracked build.gradle.kts.",
+        )
+        assertGraphRejects(graph)
     }
+
+    private fun assertGraphRejects(graph: GradleModuleGraph) {
+        try {
+            assertFrozenGraph(graph)
+        } catch (_: AssertionError) {
+            return
+        }
+        fail<Nothing>("Expected graph rejection, but evaluated production edges were ${graph.productionEdges}.")
+    }
+
+    private fun groovyString(value: String): String =
+        "'${value.replace("\\", "\\\\").replace("'", "\\'")}'"
 
     private data class Edge(val source: String, val target: String)
 
@@ -119,6 +177,7 @@ class ModuleGraphTest {
         val declaredProjects: Set<String>,
         val allowedEdges: Set<Edge>,
         val productionEdges: Set<Edge>,
+        val effectiveProductionClasspathEdges: Set<Edge>,
         val nonTestStructuralEdges: Set<Edge>,
     ) {
         fun reachableFrom(source: String): Set<String> {
@@ -135,40 +194,56 @@ class ModuleGraphTest {
         }
 
         companion object {
-            fun read(root: Path): GradleModuleGraph {
-                val evaluatedModel = readEvaluatedModel(root)
+            fun read(root: Path, injectedInitScript: String? = null): GradleModuleGraph {
+                val evaluatedModel = readEvaluatedModel(root, injectedInitScript)
                 val manifest = parseManifest(root.resolve("gradle/module-graph.txt"))
                 assertTrue(
                     structuralProjectPaths.all { it in evaluatedModel.projects },
                     "Gradle must retain its deterministic root and structural container projects.",
                 )
-                val productionEdges = evaluatedModel.dependencies
-                    .filter { it.source in productionProjects && !it.configuration.contains("test", ignoreCase = true) }
+                val effectiveProductionClasspathEdges = evaluatedModel.effectiveProductionClasspathDependencies
+                    .filter { it.source in productionProjects }
                     .map { Edge(it.source, it.target) }
                     .toSet()
+                val directNonTestProductionEdges = evaluatedModel.dependencies
+                    .filter { it.source in productionProjects && !isExplicitTestOnlyConfiguration(it.configuration) }
+                    .map { Edge(it.source, it.target) }
+                    .toSet()
+                val productionEdges = directNonTestProductionEdges + effectiveProductionClasspathEdges
                 val nonTestStructuralEdges = evaluatedModel.dependencies
-                    .filter { it.source in structuralProjectPaths && !it.configuration.contains("test", ignoreCase = true) }
+                    .filter { it.source in structuralProjectPaths && !isExplicitTestOnlyConfiguration(it.configuration) }
                     .map { Edge(it.source, it.target) }
                     .toSet()
                 return GradleModuleGraph(
                     evaluatedModel.projects - structuralProjectPaths,
                     manifest,
                     productionEdges,
+                    effectiveProductionClasspathEdges,
                     nonTestStructuralEdges,
                 )
             }
 
-            private fun readEvaluatedModel(root: Path): EvaluatedModel {
+            private fun readEvaluatedModel(root: Path, injectedInitScript: String?): EvaluatedModel {
                 val initScript = Files.createTempFile("cockpit-module-graph-", ".gradle")
+                val mutationScript = injectedInitScript?.let {
+                    Files.createTempFile("cockpit-module-graph-mutation-", ".gradle")
+                }
                 val outputFile = Files.createTempFile("cockpit-module-graph-output-", ".txt")
                 try {
                     Files.writeString(initScript, evaluatedModelInitScript)
+                    if (mutationScript != null) {
+                        Files.writeString(mutationScript, injectedInitScript)
+                    }
                     val command = if (System.getProperty("os.name").startsWith("Windows")) {
                         mutableListOf("cmd", "/c", "gradlew.bat")
                     } else {
                         mutableListOf("./gradlew")
                     }.apply {
-                        addAll(listOf("--no-daemon", "--console=plain", "-I", initScript.toString(), "cockpitModuleGraphSnapshot"))
+                        addAll(listOf("--no-daemon", "--console=plain", "-I", initScript.toString()))
+                        if (mutationScript != null) {
+                            addAll(listOf("-I", mutationScript.toString()))
+                        }
+                        add("cockpitModuleGraphSnapshot")
                     }
                     val process = ProcessBuilder(command)
                         .directory(root.toFile())
@@ -186,6 +261,7 @@ class ModuleGraphTest {
                     return parseEvaluatedModel(output)
                 } finally {
                     Files.deleteIfExists(initScript)
+                    mutationScript?.let(Files::deleteIfExists)
                     Files.deleteIfExists(outputFile)
                 }
             }
@@ -202,6 +278,7 @@ class ModuleGraphTest {
             private fun parseEvaluatedModel(output: String): EvaluatedModel {
                 val projects = mutableSetOf<String>()
                 val dependencies = mutableSetOf<EvaluatedProjectDependency>()
+                val effectiveProductionClasspathDependencies = mutableSetOf<EvaluatedProjectDependency>()
                 output.lineSequence().forEach { line ->
                     when {
                         line.startsWith(projectMarker) -> projects += line.removePrefix(projectMarker)
@@ -210,15 +287,28 @@ class ModuleGraphTest {
                             assertEquals(3, fields.size, "Malformed evaluated project dependency: $line")
                             dependencies += EvaluatedProjectDependency(fields[0], fields[1], fields[2])
                         }
+                        line.startsWith(effectiveDependencyMarker) -> {
+                            val fields = line.removePrefix(effectiveDependencyMarker).split('|')
+                            assertEquals(3, fields.size, "Malformed effective production classpath dependency: $line")
+                            effectiveProductionClasspathDependencies +=
+                                EvaluatedProjectDependency(fields[0], fields[1], fields[2])
+                        }
                     }
                 }
                 assertTrue(projects.isNotEmpty(), "The evaluated Gradle module graph produced no project paths.\n$output")
-                return EvaluatedModel(projects, dependencies)
+                return EvaluatedModel(projects, dependencies, effectiveProductionClasspathDependencies)
             }
+
+            private fun isExplicitTestOnlyConfiguration(name: String): Boolean =
+                explicitTestOnlyConfiguration.matches(name)
 
             private val manifestDeclaration = Regex("^(:[A-Za-z0-9-]+(?::[A-Za-z0-9-]+)*) -> (:[A-Za-z0-9-]+(?::[A-Za-z0-9-]+)*)$")
             private const val projectMarker = "COCKPIT_MODULE_PROJECT="
             private const val dependencyMarker = "COCKPIT_MODULE_EDGE="
+            private const val effectiveDependencyMarker = "COCKPIT_MODULE_EFFECTIVE_PRODUCTION_EDGE="
+            private val explicitTestOnlyConfiguration = Regex(
+                """(?:(?:test|androidTest|testFixtures)|(?:[a-z][A-Za-z0-9]*)?(?:UnitTest|AndroidTest))(?:Api|Implementation|CompileOnly|RuntimeOnly|CompileClasspath|RuntimeClasspath|AnnotationProcessor|Kapt|Ksp)""",
+            )
             private val evaluatedModelInitScript =
                 """
                 gradle.projectsEvaluated {
@@ -228,10 +318,24 @@ class ModuleGraphTest {
                             root.allprojects.collect { it.path }.sort().each {
                                 println("COCKPIT_MODULE_PROJECT=" + it)
                             }
+                            def explicitTestOnlyConfiguration = { name ->
+                                name ==~ /(?:(?:test|androidTest|testFixtures)|(?:[a-z][A-Za-z0-9]*)?(?:UnitTest|AndroidTest))(?:Api|Implementation|CompileOnly|RuntimeOnly|CompileClasspath|RuntimeClasspath|AnnotationProcessor|Kapt|Ksp)/
+                            }
                             root.allprojects.each { source ->
                                 source.configurations.each { configuration ->
                                     configuration.dependencies.withType(org.gradle.api.artifacts.ProjectDependency).each { dependency ->
                                         println("COCKPIT_MODULE_EDGE=" + source.path + "|" + configuration.name + "|" + dependency.path)
+                                    }
+                                    def productionClasspath =
+                                        (configuration.name == "compileClasspath" ||
+                                            configuration.name == "runtimeClasspath" ||
+                                            configuration.name.endsWith("CompileClasspath") ||
+                                            configuration.name.endsWith("RuntimeClasspath")) &&
+                                        !explicitTestOnlyConfiguration(configuration.name)
+                                    if (productionClasspath) {
+                                        configuration.allDependencies.withType(org.gradle.api.artifacts.ProjectDependency).each { dependency ->
+                                            println("COCKPIT_MODULE_EFFECTIVE_PRODUCTION_EDGE=" + source.path + "|" + configuration.name + "|" + dependency.path)
+                                        }
                                     }
                                 }
                             }
@@ -244,6 +348,7 @@ class ModuleGraphTest {
         private data class EvaluatedModel(
             val projects: Set<String>,
             val dependencies: Set<EvaluatedProjectDependency>,
+            val effectiveProductionClasspathDependencies: Set<EvaluatedProjectDependency>,
         )
 
         private data class EvaluatedProjectDependency(
