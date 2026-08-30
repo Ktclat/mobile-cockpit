@@ -5,6 +5,7 @@ import java.nio.file.Path
 import java.security.MessageDigest
 import java.util.Properties
 import javax.xml.parsers.DocumentBuilderFactory
+import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -28,7 +29,70 @@ class VersionCatalogPolicyTest {
         assertTrue(wrapperJar.exists(), "The Gradle wrapper JAR must be present and verified.")
         assertTrue(gradleProperties.exists(), "Gradle must be configured to reject unverified dependencies.")
 
-        val parsedCatalog = parseCatalog(Files.readString(catalog))
+        validateCatalogPolicy(
+            catalog = Files.readString(catalog),
+            verifiedComponents = verifiedComponents(verificationMetadata),
+        )
+        validateGradlePropertiesPolicy(Files.readString(gradleProperties))
+        validateWrapperProperties(loadProperties(Files.readString(wrapperProperties)))
+        assertTrue(
+            sha256(wrapperJar) == "497c8c2a7e5031f6aa847f88104aa80a93532ec32ee17bdb8d1d2f67a194a9c7",
+            "The Gradle wrapper JAR must match the official Gradle 9.5.0 SHA-256 checksum.",
+        )
+    }
+
+    @Test
+    fun rejectsCatalogDeclarationsItCannotValidate() {
+        val root = projectRoot()
+
+        assertCatalogDeclarationsRejected(
+            catalog = Files.readString(root.resolve("gradle/libs.versions.toml")),
+            verifiedComponents = verifiedComponents(root.resolve("gradle/verification-metadata.xml")),
+        )
+    }
+
+    @Test
+    fun rejectsWrapperUrlThatIsNotTheOfficialPinnedDistribution() {
+        assertWrapperUrlRejected(Files.readString(projectRoot().resolve("gradle/wrapper/gradle-wrapper.properties")))
+    }
+
+    @Test
+    fun rejectsCatalogAdversariesWithCrLfInput() {
+        val root = projectRoot()
+        val catalog = Files.readString(root.resolve("gradle/libs.versions.toml"))
+            .replace("\r\n", "\n")
+            .replace("\n", "\r\n")
+
+        assertCatalogDeclarationsRejected(
+            catalog = catalog,
+            verifiedComponents = verifiedComponents(root.resolve("gradle/verification-metadata.xml")),
+        )
+    }
+
+    @Test
+    fun adversarialValidationDoesNotMutateTrackedPolicyFiles() {
+        val root = projectRoot()
+        val catalogPath = root.resolve("gradle/libs.versions.toml")
+        val wrapperPath = root.resolve("gradle/wrapper/gradle-wrapper.properties")
+        val originalCatalogBytes = Files.readAllBytes(catalogPath)
+        val originalWrapperBytes = Files.readAllBytes(wrapperPath)
+
+        assertCatalogDeclarationsRejected(
+            catalog = Files.readString(catalogPath),
+            verifiedComponents = verifiedComponents(root.resolve("gradle/verification-metadata.xml")),
+        )
+        assertWrapperUrlRejected(Files.readString(wrapperPath))
+
+        assertArrayEquals(originalCatalogBytes, Files.readAllBytes(catalogPath), "Catalog validation must be pure.")
+        assertArrayEquals(originalWrapperBytes, Files.readAllBytes(wrapperPath), "Wrapper validation must be pure.")
+    }
+
+    private fun projectRoot(): Path =
+        generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath()) { it.parent }
+            .first { it.resolve(".git").exists() }
+
+    private fun validateCatalogPolicy(catalog: String, verifiedComponents: Set<String>) {
+        val parsedCatalog = parseCatalog(catalog)
         val versions = parsedCatalog.versions
         assertTrue(versions.isNotEmpty(), "The catalog must declare pinned versions.")
         frozenVersions.forEach { (name, expectedVersion) ->
@@ -47,7 +111,6 @@ class VersionCatalogPolicyTest {
         frozenAliases.forEach { (name, expectedCoordinate) ->
             assertEquals(expectedCoordinate, aliasesByName[name]?.coordinate, "Alias '$name' must retain its frozen component.")
         }
-        val verifiedComponents = verifiedComponents(verificationMetadata)
         aliases.forEach { alias ->
             assertFalse(
                 alias.version.contains(dynamicOrRangeVersion),
@@ -58,63 +121,66 @@ class VersionCatalogPolicyTest {
                 "${alias.kind} alias '${alias.name}' resolves '${alias.coordinate}' without SHA-256 verification for every artifact.",
             )
         }
+    }
 
+    private fun validateGradlePropertiesPolicy(gradleProperties: String) {
         assertTrue(
-            Files.readString(gradleProperties).lineSequence().any { it.trim() == "org.gradle.dependency.verification=strict" },
+            gradleProperties.lineSequence().any { it.trim() == "org.gradle.dependency.verification=strict" },
             "Gradle must reject dependencies that are not recorded in verification metadata.",
         )
-        val parsedWrapperProperties = Properties().apply {
-            Files.newBufferedReader(wrapperProperties).use(::load)
-        }
+    }
+
+    private fun validateWrapperProperties(wrapperProperties: Properties) {
         assertTrue(
-            parsedWrapperProperties.getProperty("distributionSha256Sum") ==
+            wrapperProperties.getProperty("distributionSha256Sum") ==
                 "553c78f50dafcd54d65b9a444649057857469edf836431389695608536d6b746",
             "The Gradle wrapper must pin Gradle 9.5.0's official SHA-256 distribution checksum.",
         )
         assertEquals(
             "https://services.gradle.org/distributions/gradle-9.5.0-bin.zip",
-            parsedWrapperProperties.getProperty("distributionUrl"),
+            wrapperProperties.getProperty("distributionUrl"),
             "The Gradle wrapper must use the exact official pinned binary distribution URL.",
         )
-        assertTrue(
-            sha256(wrapperJar) == "497c8c2a7e5031f6aa847f88104aa80a93532ec32ee17bdb8d1d2f67a194a9c7",
-            "The Gradle wrapper JAR must match the official Gradle 9.5.0 SHA-256 checksum.",
-        )
     }
 
-    @Test
-    fun rejectsCatalogDeclarationsItCannotValidate() {
-        val catalog = projectRoot().resolve("gradle/libs.versions.toml")
+    private fun assertCatalogDeclarationsRejected(catalog: String, verifiedComponents: Set<String>) {
+        catalogAdversaries.forEach { adversary ->
+            assertRejectedMutation(catalog, adversary.description, adversary.mutate) { mutatedCatalog ->
+                validateCatalogPolicy(mutatedCatalog, verifiedComponents)
+            }
+        }
+    }
 
-        listOf<(String) -> String>(
-            { it.replace("[libraries]\n", "[libraries]\nbypass-string = \"example:artifact:1.+\"\n") },
-            {
+    private fun assertWrapperUrlRejected(wrapperProperties: String) {
+        assertRejectedMutation(
+            original = wrapperProperties,
+            description = "unofficial wrapper distribution URL",
+            mutate = {
                 it.replace(
-                    "[libraries]\n",
-                    "[libraries]\nbypass-group-name = { group = \"example\", name = \"artifact\", version = \"1.+\" }\n",
+                    "distributionUrl=https\\://services.gradle.org/distributions/gradle-9.5.0-bin.zip",
+                    "distributionUrl=https\\://mirror.example/gradle-9.5.0-bin.zip",
                 )
             },
-            { "$it\n[libraries.bypass-dotted]\nmodule = \"example:artifact\"\nversion = \"1.+\"\n" },
-            { it.replace("[versions]\n", "[versions]\nbypass-rich = { strictly = \"1.0\", prefer = \"1.+\" }\n") },
-        ).forEach { mutate ->
-            assertPolicyRejects(catalog, mutate)
+        ) { mutatedWrapperProperties ->
+            validateWrapperProperties(loadProperties(mutatedWrapperProperties))
         }
     }
 
-    @Test
-    fun rejectsWrapperUrlThatIsNotTheOfficialPinnedDistribution() {
-        val wrapperProperties = projectRoot().resolve("gradle/wrapper/gradle-wrapper.properties")
-        assertPolicyRejects(wrapperProperties) {
-            it.replace(
-                "distributionUrl=https\\://services.gradle.org/distributions/gradle-9.5.0-bin.zip",
-                "distributionUrl=https\\://mirror.example/gradle-9.5.0-bin.zip",
-            )
-        }
+    private fun assertRejectedMutation(
+        original: String,
+        description: String,
+        mutate: (String) -> String,
+        validate: (String) -> Unit,
+    ) {
+        val normalized = normalizeLineEndings(original)
+        val mutated = mutate(normalized)
+        assertFalse(mutated == normalized, "Adversarial mutation '$description' must change the normalized input.")
+        assertThrows(AssertionError::class.java) { validate(mutated) }
     }
 
-    private fun projectRoot(): Path =
-        generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath()) { it.parent }
-            .first { it.resolve(".git").exists() }
+    private fun normalizeLineEndings(value: String): String = value.replace("\r\n", "\n").replace('\r', '\n')
+
+    private fun loadProperties(value: String): Properties = Properties().apply { value.reader().use(::load) }
 
     private fun parseCatalog(catalog: String): Catalog {
         val versions = linkedMapOf<String, String>()
@@ -202,17 +268,9 @@ class VersionCatalogPolicyTest {
             "%02x".format(byte.toInt() and 0xff)
         }
 
-    private fun assertPolicyRejects(file: Path, mutate: (String) -> String) {
-        val original = Files.readString(file)
-        try {
-            Files.writeString(file, mutate(original))
-            assertThrows(AssertionError::class.java) { rejectsDynamicAndUnverifiedDependencies() }
-        } finally {
-            Files.writeString(file, original)
-        }
-    }
-
     private data class Catalog(val versions: Map<String, String>, val aliases: List<Alias>)
+
+    private data class CatalogAdversary(val description: String, val mutate: (String) -> String)
 
     private data class UnresolvedAlias(
         val name: String,
@@ -228,6 +286,23 @@ class VersionCatalogPolicyTest {
     private enum class CatalogSection { VERSIONS, LIBRARIES, PLUGINS }
 
     private companion object {
+        val catalogAdversaries = listOf(
+            CatalogAdversary("string library declaration") {
+                it.replace("[libraries]\n", "[libraries]\nbypass-string = \"example:artifact:1.+\"\n")
+            },
+            CatalogAdversary("group and name library declaration") {
+                it.replace(
+                    "[libraries]\n",
+                    "[libraries]\nbypass-group-name = { group = \"example\", name = \"artifact\", version = \"1.+\" }\n",
+                )
+            },
+            CatalogAdversary("dotted library table") {
+                "$it\n[libraries.bypass-dotted]\nmodule = \"example:artifact\"\nversion = \"1.+\"\n"
+            },
+            CatalogAdversary("rich version declaration") {
+                it.replace("[versions]\n", "[versions]\nbypass-rich = { strictly = \"1.0\", prefer = \"1.+\" }\n")
+            },
+        )
         val dynamicOrRangeVersion = Regex("[+*]|\\blatest\\.|[\\[\\]()]")
         val frozenVersions = mapOf(
             "agp" to "9.3.0",
