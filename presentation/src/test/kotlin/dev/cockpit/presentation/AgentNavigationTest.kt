@@ -10,6 +10,7 @@ import androidx.compose.ui.test.performClick
 import dev.cockpit.domain.AgentId
 import dev.cockpit.domain.ConversationId
 import dev.cockpit.domain.ConversationRevision
+import dev.cockpit.domain.conversation.ConversationMessageDestination
 import dev.cockpit.projection.model.AgentDetailProjection
 import dev.cockpit.projection.model.AgentSummaryProjection
 import dev.cockpit.projection.model.ArchiveProjectionState
@@ -178,6 +179,7 @@ class AgentNavigationTest {
         id = id,
         agentId = agentId,
         revision = revision,
+        messageDestination = ConversationMessageDestination(id, revision),
         archiveState = ArchiveProjectionState.ACTIVE,
         drafts = emptyList(),
         timeline = emptyList(),

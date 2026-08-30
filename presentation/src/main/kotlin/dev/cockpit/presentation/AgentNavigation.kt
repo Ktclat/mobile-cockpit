@@ -3,6 +3,7 @@ package dev.cockpit.presentation
 import android.util.Base64
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -15,6 +16,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.disabled
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
@@ -25,6 +29,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import dev.cockpit.projection.model.AgentDetailProjection
+import dev.cockpit.domain.conversation.ConversationMessageDestination
 import dev.cockpit.projection.model.ConversationProjection
 import dev.cockpit.projection.model.HomeProjection
 
@@ -34,6 +39,8 @@ internal fun AgentNavigationRoot(
     homeProjection: HomeProjection,
     agentDetail: (String) -> AgentDetailProjection?,
     conversation: (String) -> ConversationProjection?,
+    onSaveDraft: suspend (ConversationMessageDestination, String) -> Boolean,
+    onSendMessage: suspend (ConversationMessageDestination, String) -> Boolean,
 ) {
     val navigation = rememberNavController()
     val backStackEntry by navigation.currentBackStackEntryAsState()
@@ -56,18 +63,20 @@ internal fun AgentNavigationRoot(
             composable(NavigationRoute.AgentPattern) { entry ->
                 val id = NavigationRouteToken.decode(entry.arguments?.getString(NavigationRoute.AgentIdArgument))
                 val detail = id?.let(agentDetail)
-                if (detail == null) EmptyState("Agent is not available") else {
+                if (detail == null || detail.id.value != id) EmptyState("Agent is not available") else {
                     AgentDetailScreen(detail) { navigation.navigate(NavigationRoute.conversation(it)) }
                 }
             }
             composable(NavigationRoute.ConversationPattern) { entry ->
                 val id = NavigationRouteToken.decode(entry.arguments?.getString(NavigationRoute.ConversationIdArgument))
                 val projection = id?.let(conversation)
-                if (projection == null) EmptyState("Conversation is not available") else {
+                if (projection == null || projection.id.value != id) EmptyState("Conversation is not available") else {
                     ConversationScreen(
                         projection = projection,
                         agentName = agentDetail(projection.agentId.value)?.name ?: "Agent ${projection.agentId.value}",
                         onBack = navigation::navigateUp,
+                        onSaveDraft = onSaveDraft,
+                        onSendMessage = onSendMessage,
                     )
                 }
             }
@@ -116,14 +125,16 @@ private fun AgentDetailScreen(
 private fun ConversationScreen(
     projection: ConversationProjection,
     agentName: String,
-    onBack: () -> Unit,
+    onBack: () -> Boolean,
+    onSaveDraft: suspend (ConversationMessageDestination, String) -> Boolean,
+    onSendMessage: suspend (ConversationMessageDestination, String) -> Boolean,
 ) {
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        NavigationAction("Back", "Navigate up", onBack)
         BasicText(agentName)
         BasicText("Conversation ${projection.id.value}")
         BasicText("Workspace: not configured")
         BasicText("Conversation is active")
+        ConversationComposer(projection, agentName, onSaveDraft, onSendMessage, onBack)
     }
 }
 
@@ -142,7 +153,7 @@ private fun RootNavigation(navigation: NavHostController) {
 }
 
 @Composable
-private fun NavigationAction(label: String, contentDescription: String, onClick: () -> Unit) {
+internal fun NavigationAction(label: String, contentDescription: String, onClick: () -> Unit) {
     BasicText(
         text = label,
         modifier = Modifier

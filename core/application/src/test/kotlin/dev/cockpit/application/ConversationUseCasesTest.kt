@@ -210,6 +210,15 @@ class ConversationUseCasesTest {
         assertEquals(0, missing.writes + archived.writes + wrongIdThatLoadsAuthoritativeFact.writes)
     }
 
+    @Test
+    fun successfulSendRemovesOnlyItsExactPersistedDraft() = runBlocking {
+        val exact = ConversationMessageDestination(ConversationId("conversation-1"), ConversationRevision(4))
+        val historic = ConversationMessageDestination(ConversationId("conversation-1"), ConversationRevision(3))
+        val repository = RecordingConversationRepository(snapshot().copy(drafts = listOf(Draft(exact, "sent"), Draft(historic, "keep"))))
+
+        assertEquals(SendConversationMessageResult.Sent, SendConversationMessage(repository, object : IdGenerator { override fun nextId() = "message-1" })(exact, "sent"))
+        assertEquals(listOf(Draft(historic, "keep")), repository.current.drafts)
+    }
     private class RecordingAgentRepository : AgentRepository {
         var state: AgentPersistenceState? = null
         override suspend fun save(state: AgentPersistenceState) { this.state = state }

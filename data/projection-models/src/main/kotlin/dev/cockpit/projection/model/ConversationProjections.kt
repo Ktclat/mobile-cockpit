@@ -17,6 +17,7 @@ data class ConversationProjection(
     val id: ConversationId,
     val agentId: AgentId,
     val revision: ConversationRevision,
+    val messageDestination: ConversationMessageDestination,
     val archiveState: ArchiveProjectionState,
     val drafts: List<DraftProjection>,
     val timeline: List<TimelineItemProjection>,

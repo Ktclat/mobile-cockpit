@@ -21,7 +21,7 @@ class SendConversationMessage(private val repository: ConversationRepository, pr
         val ordinal = snapshot.messages.maxOfOrNull { it.ordinal }?.let { if (it == Long.MAX_VALUE) return SendConversationMessageResult.Rejected else it + 1 } ?: 0L
         val message = Message(destination.conversationId, text)
         val accepted = try { snapshot.conversation.conversation.accept(message, destination) } catch (_: ConversationDestinationRejected) { return SendConversationMessageResult.Rejected }
-        repository.save(snapshot.copy(conversation = ConversationPersistenceState(accepted, snapshot.conversation.archiveState), messages = snapshot.messages + MessagePersistenceState(ids.nextId(), message, ordinal, MessageRole.USER, MessageSource.USER, MessageStatus.ACCEPTED)))
+        repository.save(snapshot.copy(conversation = ConversationPersistenceState(accepted, snapshot.conversation.archiveState), messages = snapshot.messages + MessagePersistenceState(ids.nextId(), message, ordinal, MessageRole.USER, MessageSource.USER, MessageStatus.ACCEPTED), drafts = snapshot.drafts.filterNot { it.destination == destination }))
         return SendConversationMessageResult.Sent
     }
 }

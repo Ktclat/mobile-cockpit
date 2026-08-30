@@ -6,4 +6,4 @@ import dev.cockpit.domain.ConversationRevision
 data class ConversationMessageDestination(
     val conversationId: ConversationId,
     val expectedConversationRevision: ConversationRevision,
-)
+) : ComposerDestination

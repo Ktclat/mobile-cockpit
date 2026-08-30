@@ -2,6 +2,7 @@ package dev.cockpit.projection
 
 import dev.cockpit.domain.AgentId
 import dev.cockpit.domain.ConversationId
+import dev.cockpit.domain.conversation.ConversationMessageDestination
 import dev.cockpit.persistence.api.AgentConversationReadRepository
 import dev.cockpit.persistence.api.ArchiveState
 import dev.cockpit.persistence.api.ConversationSnapshot
@@ -40,6 +41,7 @@ class ConversationProjector(private val facts: AgentConversationReadRepository) 
         id = conversation.conversation.id,
         agentId = conversation.conversation.agentId,
         revision = conversation.conversation.revision,
+        messageDestination = ConversationMessageDestination(conversation.conversation.id, conversation.conversation.revision),
         archiveState = conversation.archiveState.toProjection(),
         drafts = drafts.map { DraftProjection(it.destination, it.text) },
         timeline = messages.sortedBy { it.ordinal }.map { fact -> TimelineItemProjection.MessageItem(MessageProjection(fact.id, fact.message.text, fact.ordinal, MessageRoleProjection.valueOf(fact.role.name), MessageSourceProjection.valueOf(fact.source.name), MessageStatusProjection.valueOf(fact.status.name))) },
