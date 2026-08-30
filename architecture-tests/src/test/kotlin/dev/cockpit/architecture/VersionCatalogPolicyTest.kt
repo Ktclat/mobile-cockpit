@@ -3,6 +3,7 @@ package dev.cockpit.architecture
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
+import java.security.SecureRandom
 import java.util.Properties
 import java.util.concurrent.TimeUnit
 import javax.xml.parsers.DocumentBuilderFactory
@@ -114,7 +115,7 @@ class VersionCatalogPolicyTest {
         val result = runEvaluatedDependencyPolicy()
 
         assertTrue(
-            result.completed && result.exitCode == 0,
+            result.policyAccepted,
             "Current evaluated external dependency declarations must remain fixed and accepted.\n${result.output}",
         )
     }
@@ -125,7 +126,7 @@ class VersionCatalogPolicyTest {
         val missingEvidence = dynamicDependencyEvidence.filterNot(result.output::contains)
 
         assertFalse(
-            result.completed && result.exitCode == 0,
+            result.policyAccepted,
             "Evaluated Gradle policy must reject direct dynamic declarations in root, custom, subproject, " +
                 "dependency-constraint, and buildscript configurations.\n${result.output}",
         )
@@ -141,7 +142,7 @@ class VersionCatalogPolicyTest {
         val missingEvidence = lateDynamicDependencyEvidence.filterNot(result.output::contains)
 
         assertFalse(
-            result.completed && result.exitCode == 0,
+            result.policyAccepted,
             "Evaluated Gradle policy must reject dependencies added by later projectsEvaluated and " +
                 "taskGraph.whenReady listeners.\n${result.output}",
         )
@@ -156,12 +157,47 @@ class VersionCatalogPolicyTest {
         val result = runEvaluatedDependencyPolicy(taskCollisionFixture)
 
         assertFalse(
-            result.completed && result.exitCode == 0,
+            result.policyAccepted,
             "A build that preclaims the reserved dependency-policy task name must fail closed.\n${result.output}",
         )
         assertTrue(
             result.output.contains("COCKPIT_DEPENDENCY_POLICY_TASK_COLLISION=cockpitVerifyEvaluatedDependencyPolicy"),
             "Task collision failure must carry deterministic policy evidence.\n${result.output}",
+        )
+    }
+
+    @Test
+    fun evaluatedGradleRunnerRejectsSkippedOrClearedAuthorityTask() {
+        val outcomes = authorityTaskSuppressions.associate { suppression ->
+            suppression.description to runEvaluatedDependencyPolicy(lateInitScript = suppression.script)
+        }
+
+        assertTrue(
+            outcomes.all { (_, result) -> result.completed && result.exitCode == 0 },
+            "Suppression fixtures must isolate an exit-zero task bypass: $outcomes",
+        )
+        assertTrue(
+            outcomes.none { (_, result) -> result.policyAccepted },
+            "A skipped or action-cleared authority task must not satisfy policy acceptance: $outcomes",
+        )
+    }
+
+    @Test
+    fun completionAttestationMustBeOneExactLineAlongsideSuccessfulExit() {
+        val expected = "COCKPIT_DEPENDENCY_POLICY_COMPLETE=00112233445566778899aabbccddeeff"
+        val invalidResults = listOf(
+            GradleResult(completed = true, exitCode = 0, output = "", expectedCompletionSentinel = expected),
+            GradleResult(completed = true, exitCode = 0, output = "$expected\n$expected\n", expectedCompletionSentinel = expected),
+            GradleResult(completed = true, exitCode = 0, output = "prefix$expected\n", expectedCompletionSentinel = expected),
+            GradleResult(completed = true, exitCode = 0, output = "$expected suffix\n", expectedCompletionSentinel = expected),
+            GradleResult(completed = true, exitCode = 1, output = "$expected\n", expectedCompletionSentinel = expected),
+            GradleResult(completed = false, exitCode = null, output = "$expected\n", expectedCompletionSentinel = expected),
+        )
+
+        invalidResults.forEach { result -> assertFalse(result.policyAccepted, "Invalid attestation was accepted: $result") }
+        assertTrue(
+            GradleResult(true, 0, "diagnostic\n$expected\n", expected).policyAccepted,
+            "Exactly one exact completion line plus exit zero must be accepted.",
         )
     }
 
@@ -175,6 +211,7 @@ class VersionCatalogPolicyTest {
     ): GradleResult {
         val root = projectRoot()
         val tempDirectory = Files.createTempDirectory("cockpit-dependency-policy-")
+        val expectedCompletionSentinel = newCompletionSentinel()
         val fixtureRoot = fixture?.let { tempDirectory.resolve("fixture") }
         val policyScript = tempDirectory.resolve("dependency-policy.gradle")
         val lateScript = lateInitScript?.let { tempDirectory.resolve("late-mutation.gradle") }
@@ -205,7 +242,7 @@ class VersionCatalogPolicyTest {
             unit = TimeUnit.SECONDS,
             ownedTemporaryDirectory = tempDirectory,
             prepare = {
-                Files.writeString(policyScript, evaluatedDependencyPolicyInitScript)
+                Files.writeString(policyScript, evaluatedDependencyPolicyInitScript(expectedCompletionSentinel))
                 if (lateScript != null) Files.writeString(lateScript, lateInitScript)
                 if (fixtureRoot != null) {
                     Files.createDirectories(fixtureRoot.resolve("child"))
@@ -219,7 +256,14 @@ class VersionCatalogPolicyTest {
             completed = processResult.completed,
             exitCode = processResult.exitCode,
             output = processResult.output,
+            expectedCompletionSentinel = expectedCompletionSentinel,
         )
+    }
+
+    private fun newCompletionSentinel(): String {
+        val nonce = ByteArray(32).also(completionNonceRandom::nextBytes)
+            .joinToString(separator = "") { byte -> "%02x".format(byte.toInt() and 0xff) }
+        return "$completionSentinelPrefix$nonce"
     }
 
     private fun validateCatalogPolicy(catalog: String, verifiedComponents: Set<String>) {
@@ -437,9 +481,22 @@ class VersionCatalogPolicyTest {
 
     private data class Catalog(val versions: Map<String, String>, val aliases: List<Alias>)
 
-    private data class GradleResult(val completed: Boolean, val exitCode: Int?, val output: String)
+    private data class GradleResult(
+        val completed: Boolean,
+        val exitCode: Int?,
+        val output: String,
+        val expectedCompletionSentinel: String,
+    ) {
+        val policyAccepted: Boolean
+            get() =
+                completed &&
+                    exitCode == 0 &&
+                    output.lineSequence().count { line -> line == expectedCompletionSentinel } == 1
+    }
 
     private data class GradleFixture(val settings: String, val rootBuild: String, val childBuild: String)
+
+    private data class TaskSuppression(val description: String, val script: String)
 
     private data class CatalogAdversary(val description: String, val mutate: (String) -> String)
 
@@ -458,7 +515,10 @@ class VersionCatalogPolicyTest {
 
     private companion object {
         const val evaluatedDependencyPolicyTaskName = "cockpitVerifyEvaluatedDependencyPolicy"
-        val evaluatedDependencyPolicyInitScript =
+        const val completionSentinelPrefix = "COCKPIT_DEPENDENCY_POLICY_COMPLETE="
+        val completionNonceRandom = SecureRandom()
+
+        fun evaluatedDependencyPolicyInitScript(completionSentinel: String) =
             """
             gradle.projectsEvaluated {
                 def root = gradle.rootProject
@@ -481,25 +541,58 @@ class VersionCatalogPolicyTest {
                                 value ==~ /(?i).*latest\..*/ ||
                                 value ==~ /.*[\[\]()].*/
                         }
+                        def nonBlank = { value -> value != null && !value.toString().trim().isEmpty() }
+                        def fixedSelector = { selector -> nonBlank(selector) && !dynamicSelector(selector) }
+                        def recordViolation = { owner, scope, configuration, kind, group, name, label, value ->
+                            violations.add(
+                                owner.path + "|" + scope + "|" + configuration.name + "|" + kind + "|" +
+                                    group + ":" + name + "|" + label + "=" + value,
+                            )
+                        }
                         def inspectConstraint = { owner, scope, configuration, kind, group, name, constraint ->
                             def selectors = [
                                 required: constraint.requiredVersion,
                                 strict: constraint.strictVersion,
                                 preferred: constraint.preferredVersion,
                             ]
-                            if (constraint.hasProperty("branch") && constraint.branch != null) {
-                                selectors.branch = constraint.branch
-                            }
                             selectors.findAll { label, value -> dynamicSelector(value) }.each { label, value ->
-                                violations.add(
-                                    owner.path + "|" + scope + "|" + configuration.name + "|" + kind + "|" +
-                                        group + ":" + name + "|" + label + "=" + value,
+                                recordViolation(owner, scope, configuration, kind, group, name, label, value)
+                            }
+                            if (constraint.hasProperty("branch") && nonBlank(constraint.branch)) {
+                                recordViolation(owner, scope, configuration, kind, group, name, "branch", constraint.branch)
+                            }
+                            if (
+                                nonBlank(constraint.preferredVersion) &&
+                                    !fixedSelector(constraint.requiredVersion) &&
+                                    !fixedSelector(constraint.strictVersion)
+                            ) {
+                                recordViolation(
+                                    owner,
+                                    scope,
+                                    configuration,
+                                    kind,
+                                    group,
+                                    name,
+                                    "preferred-without-fixed-hard-bound",
+                                    constraint.preferredVersion,
                                 )
                             }
                         }
                         def inspectConfigurations = { owner, scope, configurations ->
                             configurations.each { configuration ->
                                 configuration.dependencies.withType(org.gradle.api.artifacts.ExternalModuleDependency).each { dependency ->
+                                    if (dependency.changing) {
+                                        recordViolation(
+                                            owner,
+                                            scope,
+                                            configuration,
+                                            "dependency",
+                                            dependency.group,
+                                            dependency.name,
+                                            "changing",
+                                            true,
+                                        )
+                                    }
                                     inspectConstraint(
                                         owner,
                                         scope,
@@ -534,11 +627,20 @@ class VersionCatalogPolicyTest {
                                 "Dynamic external dependency declarations are forbidden; " + violations.size() + " violation(s).",
                             )
                         }
+                        println("$completionSentinel")
                     }
                 }
             }
             """.trimIndent()
-        val dynamicDependencyEvidence = listOf("example:plus", "example:latest", "example:range", "example:rich")
+        val dynamicDependencyEvidence = listOf(
+            "example:plus",
+            "example:latest",
+            "example:range",
+            "example:rich",
+            "example:branch",
+            "example:changing",
+            "example:prefer-only",
+        )
         val lateDynamicDependencyEvidence = listOf("example:late-projects", "example:late-graph")
         val lateDynamicDependencyInjection =
             """
@@ -584,10 +686,26 @@ class VersionCatalogPolicyTest {
 
                 configurations.create("dependencyPolicyRootProbe")
                 configurations.create("dependencyPolicyConstraintProbe")
+                configurations.create("dependencyPolicyBranchProbe")
+                configurations.create("dependencyPolicyChangingProbe")
+                configurations.create("dependencyPolicyPreferOnlyProbe")
                 dependencies {
                     add("dependencyPolicyRootProbe", "example:plus:1.+")
+                    add("dependencyPolicyBranchProbe", "example:branch:1.2.3") {
+                        version {
+                            branch = "main"
+                        }
+                    }
+                    add("dependencyPolicyChangingProbe", "example:changing:1.2.3") {
+                        changing = true
+                    }
                     constraints {
                         add("dependencyPolicyConstraintProbe", "example:range:[1,2)")
+                        add("dependencyPolicyPreferOnlyProbe", "example:prefer-only") {
+                            version {
+                                prefer("1.2.3")
+                            }
+                        }
                     }
                 }
                 """.trimIndent(),
@@ -601,6 +719,26 @@ class VersionCatalogPolicyTest {
             settings = "rootProject.name = \"dependency-policy-task-collision\"",
             rootBuild = "tasks.register(\"cockpitVerifyEvaluatedDependencyPolicy\")",
             childBuild = "",
+        )
+        val authorityTaskSuppressions = listOf(
+            TaskSuppression(
+                description = "disabled at taskGraph.whenReady",
+                script =
+                    """
+                    gradle.taskGraph.whenReady {
+                        gradle.rootProject.tasks.named("cockpitVerifyEvaluatedDependencyPolicy").get().enabled = false
+                    }
+                    """.trimIndent(),
+            ),
+            TaskSuppression(
+                description = "actions cleared by a later projectsEvaluated listener",
+                script =
+                    """
+                    gradle.projectsEvaluated {
+                        gradle.rootProject.tasks.named("cockpitVerifyEvaluatedDependencyPolicy").get().setActions([])
+                    }
+                    """.trimIndent(),
+            ),
         )
         val catalogAdversaries = listOf(
             CatalogAdversary("string library declaration") {
