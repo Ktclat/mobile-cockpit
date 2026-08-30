@@ -7,6 +7,7 @@ import dev.cockpit.domain.agent.Persona
 import dev.cockpit.domain.conversation.Conversation
 import dev.cockpit.domain.conversation.Draft
 import dev.cockpit.domain.conversation.Message
+import kotlinx.coroutines.flow.Flow
 
 enum class ArchiveState { ACTIVE, ARCHIVED }
 enum class MessageRole { USER, AGENT, SYSTEM }
@@ -31,8 +32,21 @@ data class ConversationSnapshot(
     val messages: List<MessagePersistenceState>,
     val drafts: List<Draft>,
 )
+data class AgentReadFact(val persona: PersonaPersistenceState, val agent: AgentPersistenceState)
+data class AgentDetailReadFact(val agent: AgentReadFact, val conversations: List<ConversationSnapshot>)
 
-interface ConversationRepository {
+interface AgentRepository {
+    suspend fun save(state: AgentPersistenceState)
+    suspend fun load(id: AgentId): AgentPersistenceState?
+}
+
+interface AgentConversationReadRepository {
+    fun observeConversation(id: ConversationId): Flow<ConversationSnapshot?>
+    fun observeAgentDetail(id: AgentId): Flow<AgentDetailReadFact?>
+    fun observeAgentFacts(): Flow<List<AgentReadFact>>
+}
+
+interface ConversationRepository : AgentConversationReadRepository {
     suspend fun save(snapshot: ConversationSnapshot)
     suspend fun load(conversationId: ConversationId): ConversationSnapshot?
 }

@@ -11,6 +11,8 @@ import dev.cockpit.domain.conversation.ConversationMessageDestination
 import dev.cockpit.domain.conversation.Draft
 import dev.cockpit.domain.conversation.Message
 import dev.cockpit.persistence.api.AgentPersistenceState
+import dev.cockpit.persistence.api.AgentReadFact
+import dev.cockpit.persistence.api.AgentDetailReadFact
 import dev.cockpit.persistence.api.ArchiveState
 import dev.cockpit.persistence.api.ConversationPersistenceState
 import dev.cockpit.persistence.api.ConversationSnapshot
@@ -23,6 +25,14 @@ import androidx.sqlite.SQLiteException
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import androidx.room3.testing.MigrationTestHelper
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.channels.Channel
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
@@ -199,6 +209,82 @@ class SchemaV1MigrationTest {
         repository.save(second)
 
         assertEquals(second, requireNotNull(repository.load(ConversationId("conversation-repeat"))))
+        }
+    }
+
+    @Test
+    fun agentFactsEmitInitialAndInvalidatedActiveAgentWithoutConversation() = runBlocking {
+        database = CockpitDatabase.open(temporaryDirectory.resolve("agent-facts.db").toString())
+        val repository = RoomConversationRepository(checkNotNull(database))
+        val agent = AgentPersistenceState(
+            Agent(AgentId("agent-alone"), Persona("Alone", "Blue", "Calm", "Exact", "Short"), AgentCapabilities("Local")),
+            "persona-alone",
+            0,
+            ArchiveState.ACTIVE,
+        )
+        val initial = CompletableDeferred<Unit>()
+        val views = mutableListOf<List<AgentReadFact>>()
+        val job = launch {
+            repository.observeAgentFacts().take(2).collect { view ->
+                views += view
+                if (views.size == 1) initial.complete(Unit)
+            }
+        }
+        initial.await()
+        repository.save(agent)
+        job.join()
+        assertEquals(emptyList<AgentPersistenceState>(), views.first().map { it.agent })
+        assertEquals(listOf(agent), views.last().map { it.agent })
+    }
+
+    @Test
+    fun conversationObservationEmitsInitialThenWholeAtomicReplacement() = runBlocking {
+        database = CockpitDatabase.open(temporaryDirectory.resolve("conversation-observe.db").toString())
+        val repository = RoomConversationRepository(checkNotNull(database))
+        val initialSnapshot = snapshot(ArchiveState.ACTIVE, listOf(message("initial", 0L, "initial")), listOf(Draft(ConversationMessageDestination(ConversationId("conversation-repeat"), ConversationRevision(9L)), "initial draft")))
+        val replacement = initialSnapshot.copy(
+            conversation = initialSnapshot.conversation.copy(
+                conversation = Conversation(ConversationId("conversation-repeat"), AgentId("agent-repeat"), ConversationRevision(10L)),
+                archiveState = ArchiveState.ARCHIVED,
+            ),
+            messages = listOf(message("replacement", 4L, "replacement")),
+            drafts = listOf(Draft(ConversationMessageDestination(ConversationId("conversation-repeat"), ConversationRevision(10L)), "replacement draft")),
+        )
+        repository.save(initialSnapshot)
+        val initial = CompletableDeferred<Unit>()
+        val values = mutableListOf<ConversationSnapshot?>()
+        val job = launch {
+            repository.observeConversation(ConversationId("conversation-repeat")).take(2).collect { value ->
+                values += value
+                if (values.size == 1) initial.complete(Unit)
+            }
+        }
+        initial.await()
+        repository.save(replacement)
+        job.join()
+
+        assertEquals(initialSnapshot, values.first())
+        assertEquals(replacement, values.last())
+    }
+
+    @Test
+    fun agentDetailFactsAndConversationListEmitBeforeAndAfterMutations() = runBlocking {
+        database = CockpitDatabase.open(temporaryDirectory.resolve("agent-detail-observe.db").toString())
+        val repository = RoomConversationRepository(checkNotNull(database))
+        val initialAgent = AgentPersistenceState(Agent(AgentId("agent-detail"), Persona("Detail", "Blue", "Calm", "Exact", "Short"), AgentCapabilities("Local")), "persona-detail", 6, ArchiveState.ACTIVE)
+        val initialSnapshot = ConversationSnapshot(PersonaPersistenceState("persona-detail", initialAgent.agent.persona), initialAgent, ConversationPersistenceState(Conversation(ConversationId("detail-conversation"), initialAgent.agent.id, ConversationRevision(2)), ArchiveState.ACTIVE), listOf(MessagePersistenceState("initial-message", Message(ConversationId("detail-conversation"), "initial"), 1, MessageRole.AGENT, MessageSource.RUNTIME, MessageStatus.DELIVERED)), listOf(Draft(ConversationMessageDestination(ConversationId("detail-conversation"), ConversationRevision(2)), "initial draft")))
+        val replacementAgent = initialAgent.copy(revision = 7, archiveState = ArchiveState.ARCHIVED)
+        val replacement = initialSnapshot.copy(agent = replacementAgent, conversation = ConversationPersistenceState(Conversation(ConversationId("detail-conversation"), replacementAgent.agent.id, ConversationRevision(3)), ArchiveState.ARCHIVED), messages = listOf(MessagePersistenceState("replacement-message", Message(ConversationId("detail-conversation"), "replacement"), 4, MessageRole.USER, MessageSource.USER, MessageStatus.ACCEPTED)), drafts = listOf(Draft(ConversationMessageDestination(ConversationId("detail-conversation"), ConversationRevision(3)), "replacement draft")))
+        repository.save(initialSnapshot)
+        val emissions = Channel<AgentDetailReadFact?>(Channel.UNLIMITED)
+        val job = launch { repository.observeAgentDetail(initialAgent.agent.id).collect { emissions.send(it) } }
+        try {
+            assertEquals(AgentDetailReadFact(AgentReadFact(initialSnapshot.persona, initialSnapshot.agent), listOf(initialSnapshot)), emissions.receive())
+            repository.save(replacement)
+            assertEquals(AgentDetailReadFact(AgentReadFact(replacement.persona, replacement.agent), listOf(replacement)), emissions.receive())
+            assertEquals(null, withTimeoutOrNull(250) { emissions.receive() })
+        } finally {
+            job.cancelAndJoin()
         }
     }
 

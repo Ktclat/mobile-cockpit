@@ -1,5 +1,9 @@
 plugins {
-    `java-library`
+    alias(libs.plugins.kotlin.jvm)
+}
+
+kotlin {
+    jvmToolchain(17)
 }
 
 dependencies {
@@ -10,4 +14,12 @@ dependencies {
     implementation(project(":security:vault-api"))
     implementation(project(":data:persistence-api"))
     implementation(project(":data:projection-models"))
+    implementation(libs.coroutines.core)
+
+    testImplementation(libs.junit.jupiter)
+    testRuntimeOnly(libs.junit.platform.launcher)
+}
+
+tasks.test {
+    useJUnitPlatform()
 }

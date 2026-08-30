@@ -1,6 +1,7 @@
 package dev.cockpit.persistence.room
 
 import androidx.room3.withWriteTransaction
+import androidx.room3.withReadTransaction
 import dev.cockpit.domain.AgentId
 import dev.cockpit.domain.ConversationId
 import dev.cockpit.domain.ConversationRevision
@@ -12,8 +13,20 @@ import dev.cockpit.domain.conversation.ConversationMessageDestination
 import dev.cockpit.domain.conversation.Draft
 import dev.cockpit.domain.conversation.Message
 import dev.cockpit.persistence.api.*
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
 
-class RoomConversationRepository(private val database: CockpitDatabase) : ConversationRepository {
+class RoomConversationRepository(private val database: CockpitDatabase) : ConversationRepository, AgentRepository {
+    override suspend fun save(state: AgentPersistenceState) = database.withWriteTransaction {
+        database.personaDao().upsert(PersonaPersistenceState(state.personaId, state.agent.persona).toEntity())
+        database.agentDao().upsert(state.toEntity())
+    }
+
+    override suspend fun load(id: AgentId): AgentPersistenceState? = database.withReadTransaction {
+        database.agentDao().find(id.value)?.let { agent ->
+            database.personaDao().find(agent.personaId)?.let(agent::toState)
+        }
+    }
     override suspend fun save(snapshot: ConversationSnapshot) = database.withWriteTransaction {
         database.personaDao().upsert(snapshot.persona.toEntity())
         database.agentDao().upsert(snapshot.agent.toEntity())
@@ -23,12 +36,40 @@ class RoomConversationRepository(private val database: CockpitDatabase) : Conver
         snapshot.messages.forEach { database.messageDao().insert(it.toEntity()) }
         snapshot.drafts.forEach { database.draftDao().upsert(it.toEntity()) }
     }
-    override suspend fun load(conversationId: ConversationId): ConversationSnapshot? {
-        val conversation = database.conversationDao().find(conversationId.value) ?: return null
-        val agent = database.agentDao().find(conversation.agentId) ?: return null
-        val persona = database.personaDao().find(agent.personaId) ?: return null
-        return ConversationSnapshot(persona.toState(), agent.toState(persona), conversation.toState(), database.messageDao().forConversation(conversationId.value).map { it.toState() }, database.draftDao().forConversation(conversationId.value).map { Draft(ConversationMessageDestination(ConversationId(it.conversationId), ConversationRevision(it.expectedConversationRevision)), it.text) })
+    override suspend fun load(conversationId: ConversationId): ConversationSnapshot? = database.withReadTransaction {
+        database.conversationDao().find(conversationId.value)?.let { conversation ->
+            database.agentDao().find(conversation.agentId)?.let { agent ->
+                database.personaDao().find(agent.personaId)?.let { persona ->
+                    ConversationSnapshot(persona.toState(), agent.toState(persona), conversation.toState(), database.messageDao().forConversation(conversationId.value).map { it.toState() }, database.draftDao().forConversation(conversationId.value).map { Draft(ConversationMessageDestination(ConversationId(it.conversationId), ConversationRevision(it.expectedConversationRevision)), it.text) })
+                }
+            }
+        }
     }
+    override fun observeConversation(id: ConversationId): Flow<ConversationSnapshot?> =
+        database.invalidationTracker.createFlow("personas", "agents", "conversations", "messages", "drafts").map { load(id) }
+
+    override fun observeAgentDetail(id: AgentId): Flow<AgentDetailReadFact?> =
+        database.invalidationTracker.createFlow("personas", "agents", "conversations", "messages", "drafts").map {
+            database.withReadTransaction {
+                database.agentDao().find(id.value)?.let { agent ->
+                    database.personaDao().find(agent.personaId)?.let { persona ->
+                        AgentDetailReadFact(
+                            AgentReadFact(persona.toState(), agent.toState(persona)),
+                            database.conversationDao().forAgent(id.value).mapNotNull { conversation -> load(ConversationId(conversation.id)) },
+                        )
+                    }
+                }
+            }
+        }
+
+    override fun observeAgentFacts(): Flow<List<AgentReadFact>> =
+        database.invalidationTracker.createFlow("personas", "agents").map {
+            database.withReadTransaction {
+                database.agentDao().all().mapNotNull { agent ->
+                    database.personaDao().find(agent.personaId)?.let { persona -> AgentReadFact(persona.toState(), agent.toState(persona)) }
+                }
+            }
+        }
 }
 private fun PersonaPersistenceState.toEntity() = PersonaEntity(id, persona.identity, persona.presentation, persona.voice, persona.behavioralTendency, persona.promptStyle)
 private fun AgentPersistenceState.toEntity() = AgentEntity(agent.id.value, personaId, agent.capabilities.summary, revision, archiveState.name)

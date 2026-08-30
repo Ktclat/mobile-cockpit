@@ -1,5 +1,9 @@
 plugins {
-    `java-library`
+    alias(libs.plugins.kotlin.jvm)
+}
+
+kotlin {
+    jvmToolchain(17)
 }
 
 dependencies {
@@ -7,4 +11,5 @@ dependencies {
     implementation(project(":integration:provider-api"))
     implementation(project(":data:projection-models"))
     implementation(project(":security:byte-renderer-api"))
+    implementation(libs.coroutines.core)
 }
