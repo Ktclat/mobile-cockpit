@@ -4,7 +4,9 @@ import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import kotlin.io.path.exists
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -241,8 +243,8 @@ class ArchitectureEvidenceTest {
         afterStart: (Process) -> Unit = {},
     ): EvidenceProcessResult {
         var process: Process? = null
-        var capturedTree = emptyList<ProcessHandle>()
-        var interrupted = false
+        val capturedTree = linkedMapOf<Long, ProcessHandle>()
+        val interruptState = InterruptState()
         try {
             val started = ProcessBuilder(command)
                 .directory(root.toFile())
@@ -250,10 +252,11 @@ class ArchitectureEvidenceTest {
                 .redirectOutput(output.toFile())
                 .start()
             process = started
+            captureProcessTree(started, capturedTree)
             afterStart(started)
-            capturedTree = captureProcessTree(started)
-            val completed = started.waitFor(timeout, unit)
-            if (!completed && !terminateAndReapProcessTree(started, capturedTree)) {
+            captureProcessTree(started, capturedTree)
+            val completed = waitForEvidenceProcess(started, timeout, unit, capturedTree)
+            if (!completed && !terminateAndReapProcessTree(started, capturedTree, interruptState)) {
                 throw EvidenceProcessCleanupException("Evidence process tree did not terminate within the bounded cleanup timeout")
             }
             return EvidenceProcessResult(
@@ -262,54 +265,131 @@ class ArchitectureEvidenceTest {
                 output = Files.readString(output),
             )
         } catch (error: InterruptedException) {
-            interrupted = true
+            interruptState.observed = true
             throw error
         } finally {
-            val cleanupSucceeded = process?.let { started -> terminateAndReapProcessTree(started, capturedTree) } ?: true
-            if (cleanupSucceeded) {
-                Files.deleteIfExists(output)
-            } else {
+            if (Thread.interrupted()) interruptState.observed = true
+            val cleanupSucceeded = process?.let { started ->
+                terminateAndReapProcessTree(started, capturedTree, interruptState)
+            } ?: true
+            val outputDeleted = cleanupSucceeded && deleteEvidenceOutput(output, interruptState)
+            if (!cleanupSucceeded || !outputDeleted) {
                 scheduleDeferredOutputDeletion(output, capturedTree)
-                if (interrupted) Thread.currentThread().interrupt()
+            }
+            if (interruptState.observed) Thread.currentThread().interrupt()
+            if ((!cleanupSucceeded || !outputDeleted) && !interruptState.observed) {
                 throw EvidenceProcessCleanupException("Evidence process cleanup failed; deferred output deletion was scheduled")
             }
-            if (interrupted) Thread.currentThread().interrupt()
         }
     }
 
-    private fun captureProcessTree(process: Process): List<ProcessHandle> =
-        (process.toHandle().descendants().toList() + process.toHandle()).distinct()
+    private fun waitForEvidenceProcess(
+        process: Process,
+        timeout: Long,
+        unit: TimeUnit,
+        capturedTree: MutableMap<Long, ProcessHandle>,
+    ): Boolean {
+        val deadline = System.nanoTime() + unit.toNanos(timeout)
+        while (true) {
+            captureProcessTree(process, capturedTree)
+            val remaining = deadline - System.nanoTime()
+            if (remaining <= 0) return !process.isAlive
+            val waitSlice = minOf(remaining, TimeUnit.MILLISECONDS.toNanos(processCapturePollMillis))
+            if (process.waitFor(waitSlice, TimeUnit.NANOSECONDS)) {
+                captureProcessTree(process, capturedTree)
+                return true
+            }
+        }
+    }
 
-    private fun terminateAndReapProcessTree(process: Process, capturedTree: List<ProcessHandle>): Boolean {
+    private fun captureProcessTree(process: Process, capturedTree: MutableMap<Long, ProcessHandle>) {
+        val root = process.toHandle()
+        capturedTree.putIfAbsent(root.pid(), root)
+        root.descendants().forEach { descendant ->
+            capturedTree.putIfAbsent(descendant.pid(), descendant)
+        }
+    }
+
+    private fun terminateAndReapProcessTree(
+        process: Process,
+        capturedTree: MutableMap<Long, ProcessHandle>,
+        interruptState: InterruptState,
+    ): Boolean {
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(processCleanupTimeoutSeconds)
-        val processes = capturedTree
-        processes.toList().asReversed().forEach { handle ->
+        captureProcessTree(process, capturedTree)
+        val root = process.toHandle()
+        if (root.isAlive) root.destroyForcibly()
+        captureProcessTree(process, capturedTree)
+        val processes = capturedTree.values.toList()
+        processes.filterNot { it.pid() == root.pid() }.asReversed().forEach { handle ->
             if (handle.isAlive) handle.destroyForcibly()
         }
-        val rootReaped = !process.isAlive || waitForReap(process, deadline)
-        return rootReaped && processes.all { handle -> waitForExit(handle, deadline) }
+        var allExited = true
+        processes.forEach { handle ->
+            if (!waitForExit(handle, deadline, interruptState)) allExited = false
+        }
+        val rootReaped = waitForReap(process, deadline, interruptState)
+        return allExited && rootReaped
     }
 
-    private fun waitForReap(process: Process, deadline: Long): Boolean {
-        val remaining = deadline - System.nanoTime()
-        return remaining > 0 && process.waitFor(remaining, TimeUnit.NANOSECONDS)
+    private fun waitForReap(process: Process, deadline: Long, interruptState: InterruptState): Boolean {
+        while (process.isAlive) {
+            val remaining = deadline - System.nanoTime()
+            if (remaining <= 0) return false
+            try {
+                if (process.waitFor(remaining, TimeUnit.NANOSECONDS)) return true
+            } catch (_: InterruptedException) {
+                interruptState.observed = true
+            }
+        }
+        return true
     }
 
-    private fun waitForExit(process: ProcessHandle, deadline: Long): Boolean {
-        if (!process.isAlive) return true
-        val remaining = deadline - System.nanoTime()
-        if (remaining <= 0) return false
-        return try {
-            process.onExit().get(remaining, TimeUnit.NANOSECONDS)
-            true
-        } catch (_: Exception) {
-            false
+    private fun waitForExit(process: ProcessHandle, deadline: Long, interruptState: InterruptState): Boolean {
+        while (process.isAlive) {
+            val remaining = deadline - System.nanoTime()
+            if (remaining <= 0) return false
+            try {
+                process.onExit().get(remaining, TimeUnit.NANOSECONDS)
+            } catch (_: InterruptedException) {
+                interruptState.observed = true
+            } catch (_: TimeoutException) {
+                return false
+            } catch (_: ExecutionException) {
+                return !process.isAlive
+            }
+        }
+        return true
+    }
+
+    private fun deleteEvidenceOutput(output: Path, interruptState: InterruptState): Boolean {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(processCleanupTimeoutSeconds)
+        while (true) {
+            try {
+                Files.deleteIfExists(output)
+                return true
+            } catch (_: IOException) {
+                val remaining = deadline - System.nanoTime()
+                if (remaining <= 0) return false
+                try {
+                    Thread.sleep(
+                        minOf(
+                            processOutputDeleteRetryMillis,
+                            TimeUnit.NANOSECONDS.toMillis(remaining).coerceAtLeast(1),
+                        ),
+                    )
+                } catch (_: InterruptedException) {
+                    interruptState.observed = true
+                }
+            }
         }
     }
 
-    private fun scheduleDeferredOutputDeletion(output: Path, capturedTree: List<ProcessHandle>) {
-        CompletableFuture.allOf(*capturedTree.map(ProcessHandle::onExit).toTypedArray()).whenComplete { _, _ ->
-            runCatching { Files.deleteIfExists(output) }
+    private fun scheduleDeferredOutputDeletion(output: Path, capturedTree: Map<Long, ProcessHandle>) {
+        CompletableFuture.allOf(*capturedTree.values.map(ProcessHandle::onExit).toTypedArray()).whenComplete { _, _ ->
+            val deferredInterruptState = InterruptState()
+            deleteEvidenceOutput(output, deferredInterruptState)
+            if (deferredInterruptState.observed) Thread.currentThread().interrupt()
         }
     }
 
@@ -401,9 +481,13 @@ class ArchitectureEvidenceTest {
 
     private class EvidenceProcessCleanupException(message: String) : IllegalStateException(message)
 
+    private class InterruptState(var observed: Boolean = false)
+
     private companion object {
         const val architectureSource = "docs/superpowers/specs/2026-08-30-system-architecture-v0.1.md"
         const val processCleanupTimeoutSeconds = 5L
+        const val processCapturePollMillis = 10L
+        const val processOutputDeleteRetryMillis = 10L
         val canonicalWorkflow = """
             name: Android foundation
 
