@@ -23,39 +23,31 @@ class AndroidModuleToolchainPolicyTest {
     }
 
     private fun readJavaToolchains(root: Path): Map<String, Int?> {
-        val initScript = Files.createTempFile("cockpit-java-toolchain-", ".gradle")
-        val outputFile = Files.createTempFile("cockpit-java-toolchain-output-", ".txt")
-        try {
-            Files.writeString(initScript, evaluatedToolchainInitScript)
-            val command = if (System.getProperty("os.name").startsWith("Windows")) {
-                mutableListOf("cmd", "/c", "gradlew.bat")
-            } else {
-                mutableListOf("./gradlew")
-            }.apply {
-                addAll(listOf("--no-daemon", "--console=plain", "-I", initScript.toString(), "cockpitJavaToolchainSnapshot"))
-            }
-            val process = ProcessBuilder(command)
-                .directory(root.toFile())
-                .redirectErrorStream(true)
-                .redirectOutput(outputFile.toFile())
-                .start()
-            val completed = process.waitFor(60, TimeUnit.SECONDS)
-            if (!completed) {
-                process.destroyForcibly()
-                process.waitFor(10, TimeUnit.SECONDS)
-            }
-            val output = Files.readString(outputFile)
-            assertTrue(completed, "Timed out while reading Android Java toolchains.\n$output")
-            assertEquals(0, process.exitValue(), "Unable to read Android Java toolchains:\n$output")
-            return output.lineSequence().mapNotNull { line ->
-                snapshotDeclaration.matchEntire(line)?.let { match ->
-                    match.groupValues[1] to match.groupValues[2].toIntOrNull()
-                }
-            }.toMap()
-        } finally {
-            Files.deleteIfExists(initScript)
-            Files.deleteIfExists(outputFile)
+        val temporaryDirectory = Files.createTempDirectory("cockpit-java-toolchain-")
+        val initScript = temporaryDirectory.resolve("toolchain.gradle")
+        val command = if (System.getProperty("os.name").startsWith("Windows")) {
+            mutableListOf("cmd", "/c", "gradlew.bat")
+        } else {
+            mutableListOf("./gradlew")
+        }.apply {
+            addAll(listOf("--no-daemon", "--console=plain", "-I", initScript.toString(), "cockpitJavaToolchainSnapshot"))
         }
+        val result = BoundedProcessRunner.run(
+            command = command,
+            workingDirectory = root,
+            timeout = 60,
+            unit = TimeUnit.SECONDS,
+            ownedTemporaryDirectory = temporaryDirectory,
+            prepare = { Files.writeString(initScript, evaluatedToolchainInitScript) },
+        )
+        val output = result.output
+        assertTrue(result.completed, "Timed out while reading Android Java toolchains.\n$output")
+        assertEquals(0, result.exitCode, "Unable to read Android Java toolchains:\n$output")
+        return output.lineSequence().mapNotNull { line ->
+            snapshotDeclaration.matchEntire(line)?.let { match ->
+                match.groupValues[1] to match.groupValues[2].toIntOrNull()
+            }
+        }.toMap()
     }
 
     private fun projectRoot(): Path =

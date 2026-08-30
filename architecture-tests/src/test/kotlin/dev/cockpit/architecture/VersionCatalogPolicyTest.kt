@@ -3,7 +3,6 @@ package dev.cockpit.architecture
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
-import java.util.Comparator
 import java.util.Properties
 import java.util.concurrent.TimeUnit
 import javax.xml.parsers.DocumentBuilderFactory
@@ -179,69 +178,48 @@ class VersionCatalogPolicyTest {
         val fixtureRoot = fixture?.let { tempDirectory.resolve("fixture") }
         val policyScript = tempDirectory.resolve("dependency-policy.gradle")
         val lateScript = lateInitScript?.let { tempDirectory.resolve("late-mutation.gradle") }
-        val outputFile = tempDirectory.resolve("output.txt")
-        var process: Process? = null
-        try {
-            Files.writeString(policyScript, evaluatedDependencyPolicyInitScript)
-            if (lateScript != null) Files.writeString(lateScript, lateInitScript)
-            if (fixtureRoot != null) {
-                Files.createDirectories(fixtureRoot.resolve("child"))
-                Files.writeString(fixtureRoot.resolve("settings.gradle"), fixture.settings)
-                Files.writeString(fixtureRoot.resolve("build.gradle"), fixture.rootBuild)
-                Files.writeString(fixtureRoot.resolve("child/build.gradle"), fixture.childBuild)
-            }
-            val command = if (System.getProperty("os.name").startsWith("Windows")) {
-                mutableListOf("cmd", "/c", "gradlew.bat")
-            } else {
-                mutableListOf("./gradlew")
-            }.apply {
-                addAll(
-                    listOf(
-                        "--no-daemon",
-                        "--offline",
-                        "--console=plain",
-                        "--project-cache-dir",
-                        tempDirectory.resolve("project-cache").toString(),
-                        "-I",
-                        policyScript.toString(),
-                    ),
-                )
-                if (lateScript != null) addAll(listOf("-I", lateScript.toString()))
-                if (fixtureRoot != null) addAll(listOf("-p", fixtureRoot.toString()))
-                add(evaluatedDependencyPolicyTaskName)
-            }
-            val started = ProcessBuilder(command)
-                .directory(root.toFile())
-                .redirectErrorStream(true)
-                .redirectOutput(outputFile.toFile())
-                .start()
-            process = started
-            val completed = started.waitFor(90, TimeUnit.SECONDS)
-            if (!completed) terminateProcessTree(started)
-            return GradleResult(
-                completed = completed,
-                exitCode = if (completed) started.exitValue() else null,
-                output = Files.readString(outputFile),
+        val command = if (System.getProperty("os.name").startsWith("Windows")) {
+            mutableListOf("cmd", "/c", "gradlew.bat")
+        } else {
+            mutableListOf("./gradlew")
+        }.apply {
+            addAll(
+                listOf(
+                    "--no-daemon",
+                    "--offline",
+                    "--console=plain",
+                    "--project-cache-dir",
+                    tempDirectory.resolve("project-cache").toString(),
+                    "-I",
+                    policyScript.toString(),
+                ),
             )
-        } finally {
-            if (process?.isAlive == true) terminateProcessTree(process)
-            deleteTree(tempDirectory)
+            if (lateScript != null) addAll(listOf("-I", lateScript.toString()))
+            if (fixtureRoot != null) addAll(listOf("-p", fixtureRoot.toString()))
+            add(evaluatedDependencyPolicyTaskName)
         }
-    }
-
-    private fun terminateProcessTree(process: Process) {
-        val descendants = process.descendants().toList().asReversed()
-        descendants.forEach { it.destroyForcibly() }
-        process.destroyForcibly()
-        descendants.forEach { it.onExit().get(10, TimeUnit.SECONDS) }
-        process.waitFor(10, TimeUnit.SECONDS)
-    }
-
-    private fun deleteTree(root: Path) {
-        if (!Files.exists(root)) return
-        Files.walk(root).use { paths ->
-            paths.sorted(Comparator.reverseOrder()).forEach(Files::deleteIfExists)
-        }
+        val processResult = BoundedProcessRunner.run(
+            command = command,
+            workingDirectory = root,
+            timeout = 90,
+            unit = TimeUnit.SECONDS,
+            ownedTemporaryDirectory = tempDirectory,
+            prepare = {
+                Files.writeString(policyScript, evaluatedDependencyPolicyInitScript)
+                if (lateScript != null) Files.writeString(lateScript, lateInitScript)
+                if (fixtureRoot != null) {
+                    Files.createDirectories(fixtureRoot.resolve("child"))
+                    Files.writeString(fixtureRoot.resolve("settings.gradle"), fixture.settings)
+                    Files.writeString(fixtureRoot.resolve("build.gradle"), fixture.rootBuild)
+                    Files.writeString(fixtureRoot.resolve("child/build.gradle"), fixture.childBuild)
+                }
+            },
+        )
+        return GradleResult(
+            completed = processResult.completed,
+            exitCode = processResult.exitCode,
+            output = processResult.output,
+        )
     }
 
     private fun validateCatalogPolicy(catalog: String, verifiedComponents: Set<String>) {

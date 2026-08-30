@@ -224,46 +224,37 @@ class ModuleGraphTest {
             }
 
             private fun readEvaluatedModel(root: Path, injectedInitScript: String?): EvaluatedModel {
-                val initScript = Files.createTempFile("cockpit-module-graph-", ".gradle")
-                val mutationScript = injectedInitScript?.let {
-                    Files.createTempFile("cockpit-module-graph-mutation-", ".gradle")
-                }
-                val outputFile = Files.createTempFile("cockpit-module-graph-output-", ".txt")
-                try {
-                    Files.writeString(initScript, evaluatedModelInitScript)
+                val temporaryDirectory = Files.createTempDirectory("cockpit-module-graph-")
+                val initScript = temporaryDirectory.resolve("model.gradle")
+                val mutationScript = injectedInitScript?.let { temporaryDirectory.resolve("mutation.gradle") }
+                val command = if (System.getProperty("os.name").startsWith("Windows")) {
+                    mutableListOf("cmd", "/c", "gradlew.bat")
+                } else {
+                    mutableListOf("./gradlew")
+                }.apply {
+                    addAll(listOf("--no-daemon", "--console=plain", "-I", initScript.toString()))
                     if (mutationScript != null) {
-                        Files.writeString(mutationScript, injectedInitScript)
+                        addAll(listOf("-I", mutationScript.toString()))
                     }
-                    val command = if (System.getProperty("os.name").startsWith("Windows")) {
-                        mutableListOf("cmd", "/c", "gradlew.bat")
-                    } else {
-                        mutableListOf("./gradlew")
-                    }.apply {
-                        addAll(listOf("--no-daemon", "--console=plain", "-I", initScript.toString()))
-                        if (mutationScript != null) {
-                            addAll(listOf("-I", mutationScript.toString()))
-                        }
-                        add("cockpitModuleGraphSnapshot")
-                    }
-                    val process = ProcessBuilder(command)
-                        .directory(root.toFile())
-                        .redirectErrorStream(true)
-                        .redirectOutput(outputFile.toFile())
-                        .start()
-                    val completed = process.waitFor(60, TimeUnit.SECONDS)
-                    if (!completed) {
-                        process.destroyForcibly()
-                        process.waitFor(10, TimeUnit.SECONDS)
-                    }
-                    val output = Files.readString(outputFile)
-                    assertTrue(completed, "Timed out while reading the evaluated Gradle module graph.\n$output")
-                    assertEquals(0, process.exitValue(), "Unable to read the evaluated Gradle module graph:\n$output")
-                    return parseEvaluatedModel(output)
-                } finally {
-                    Files.deleteIfExists(initScript)
-                    mutationScript?.let(Files::deleteIfExists)
-                    Files.deleteIfExists(outputFile)
+                    add("cockpitModuleGraphSnapshot")
                 }
+                val result = BoundedProcessRunner.run(
+                    command = command,
+                    workingDirectory = root,
+                    timeout = 60,
+                    unit = TimeUnit.SECONDS,
+                    ownedTemporaryDirectory = temporaryDirectory,
+                    prepare = {
+                        Files.writeString(initScript, evaluatedModelInitScript)
+                        if (mutationScript != null) {
+                            Files.writeString(mutationScript, injectedInitScript)
+                        }
+                    },
+                )
+                val output = result.output
+                assertTrue(result.completed, "Timed out while reading the evaluated Gradle module graph.\n$output")
+                assertEquals(0, result.exitCode, "Unable to read the evaluated Gradle module graph:\n$output")
+                return parseEvaluatedModel(output)
             }
 
             private fun parseManifest(file: Path): Set<Edge> {
