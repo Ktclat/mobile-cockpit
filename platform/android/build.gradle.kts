@@ -1,5 +1,19 @@
 plugins {
-    `java-library`
+    alias(libs.plugins.android.library)
+}
+
+android {
+    namespace = "dev.cockpit.platform.android"
+    compileSdk = libs.versions.compileSdk.get().toInt()
+
+    defaultConfig {
+        minSdk = libs.versions.minSdk.get().toInt()
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
 }
 
 dependencies {

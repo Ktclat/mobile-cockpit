@@ -82,7 +82,7 @@ class ModuleGraphTest {
     @Test
     fun rejectsProductionDependencyInjectedFromRootBuildLogic() {
         assertGraphRejects(projectRoot().resolve("build.gradle.kts")) {
-            "$it\n\nproject(\":presentation\") {\n    pluginManager.withPlugin(\"java-library\") {\n        dependencies.add(\n            \"implementation\",\n            dependencies.project(mapOf(\"path\" to \":spikes:ssh-transport\")),\n        )\n    }\n}\n"
+            "$it\n\nproject(\":presentation\") {\n    pluginManager.withPlugin(\"com.android.library\") {\n        dependencies.add(\n            \"implementation\",\n            dependencies.project(mapOf(\"path\" to \":spikes:ssh-transport\")),\n        )\n    }\n}\n"
         }
     }
 
