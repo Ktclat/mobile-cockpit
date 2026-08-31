@@ -219,6 +219,86 @@ class ConversationUseCasesTest {
         assertEquals(SendConversationMessageResult.Sent, SendConversationMessage(repository, object : IdGenerator { override fun nextId() = "message-1" })(exact, "sent"))
         assertEquals(listOf(Draft(historic, "keep")), repository.current.drafts)
     }
+
+    @Test
+    fun appendAgentMessageRequiresExactPostUserRevision() = runBlocking {
+        val acceptedUserDestination =
+            ConversationMessageDestination(ConversationId("conversation-1"), ConversationRevision(4))
+        val afterUser = snapshot().copy(
+            conversation = ConversationPersistenceState(
+                Conversation(ConversationId("conversation-1"), AgentId("agent-1"), ConversationRevision(5)),
+                ArchiveState.ACTIVE,
+            ),
+            messages = listOf(
+                MessagePersistenceState(
+                    "user-message",
+                    Message(ConversationId("conversation-1"), "user text"),
+                    8,
+                    MessageRole.USER,
+                    MessageSource.USER,
+                    MessageStatus.ACCEPTED,
+                ),
+            ),
+        )
+        val repository = RecordingConversationRepository(afterUser)
+
+        val appended = AppendConversationAgentMessage(
+            repository,
+            object : IdGenerator { override fun nextId() = "agent-message" },
+        )(acceptedUserDestination, "ordinary response")
+
+        assertEquals(true, appended)
+        assertEquals(1, repository.writes)
+        assertEquals(ConversationRevision(6), repository.current.conversation.conversation.revision)
+        assertEquals(listOf(8L, 9L), repository.current.messages.map { it.ordinal })
+        assertEquals(MessageRole.AGENT, repository.current.messages.last().role)
+        assertEquals(MessageSource.DEBUG, repository.current.messages.last().source)
+        assertEquals(MessageStatus.DELIVERED, repository.current.messages.last().status)
+        assertEquals("ordinary response", repository.current.messages.last().message.text)
+    }
+
+    @Test
+    fun appendAgentMessageRejectsAnyNonPostUserOrExhaustedState() = runBlocking {
+        val acceptedUserDestination =
+            ConversationMessageDestination(ConversationId("conversation-1"), ConversationRevision(4))
+        val stale = RecordingConversationRepository(snapshot())
+        val exhausted = RecordingConversationRepository(
+            snapshot().copy(
+                conversation = ConversationPersistenceState(
+                    Conversation(
+                        ConversationId("conversation-1"),
+                        AgentId("agent-1"),
+                        ConversationRevision(5),
+                    ),
+                    ArchiveState.ACTIVE,
+                ),
+                messages = listOf(
+                    MessagePersistenceState(
+                        "max",
+                        Message(ConversationId("conversation-1"), "existing"),
+                        Long.MAX_VALUE,
+                        MessageRole.USER,
+                        MessageSource.USER,
+                        MessageStatus.ACCEPTED,
+                    ),
+                ),
+            ),
+        )
+        val ids = object : IdGenerator {
+            override fun nextId(): String = error("rejected append must not allocate")
+        }
+
+        assertEquals(
+            false,
+            AppendConversationAgentMessage(stale, ids)(acceptedUserDestination, "stale"),
+        )
+        assertEquals(
+            false,
+            AppendConversationAgentMessage(exhausted, ids)(acceptedUserDestination, "no wrap"),
+        )
+        assertEquals(0, stale.writes + exhausted.writes)
+    }
+
     private class RecordingAgentRepository : AgentRepository {
         var state: AgentPersistenceState? = null
         override suspend fun save(state: AgentPersistenceState) { this.state = state }

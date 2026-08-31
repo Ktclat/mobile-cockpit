@@ -113,6 +113,43 @@ class ConversationComposerReviewTest {
         assertEquals(listOf(initial to "first", advanced to "second"), sent)
     }
 
+    @Test fun successfulSendFollowsMultipleAdvancesOnlyUntilNewEditFreezesDestination() {
+        val conversation = ConversationId("multi-advance")
+        val initial = ConversationMessageDestination(conversation, ConversationRevision(3))
+        val afterUser = ConversationMessageDestination(conversation, ConversationRevision(4))
+        val afterAgent = ConversationMessageDestination(conversation, ConversationRevision(5))
+        val externalAdvance = ConversationMessageDestination(conversation, ConversationRevision(6))
+        var projection by mutableStateOf(
+            projection(initial, listOf(DraftProjection(initial, "send once"))),
+        )
+        composeRule.setContent {
+            ConversationComposer(
+                projection,
+                "Ada",
+                onSaveDraft = { _, _ -> true },
+                onSendMessage = { _, _ ->
+                    projection = projection(afterUser, emptyList())
+                    true
+                },
+                onBack = { false },
+            )
+        }
+
+        composeRule.onNodeWithContentDescription("Send message").performClick()
+        composeRule.waitForIdle()
+        composeRule.runOnIdle { projection = projection(afterAgent, emptyList()) }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithContentDescription("Send message").assertIsEnabled()
+
+        composeRule.onNodeWithContentDescription("Compose message for Ada").performTextInput("unsent")
+        composeRule.runOnIdle { projection = projection(externalAdvance, emptyList()) }
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithText("unsent").assertIsDisplayed()
+        composeRule.onNodeWithText("Draft destination is stale. Send is disabled.").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription("Send message").assertIsNotEnabled()
+    }
+
     @Test fun conversationRouteProjectionIdentityMismatchFailsClosed() {
         val agent = AgentId("agent")
         val requested = ConversationId("requested")

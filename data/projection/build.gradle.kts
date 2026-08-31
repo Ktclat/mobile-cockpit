@@ -7,9 +7,9 @@ kotlin {
 }
 
 dependencies {
-    implementation(project(":core:domain"))
-    implementation(project(":data:persistence-api"))
-    implementation(project(":data:projection-models"))
+    api(project(":core:domain"))
+    api(project(":data:persistence-api"))
+    api(project(":data:projection-models"))
     implementation(libs.coroutines.core)
 
     testImplementation(libs.junit.jupiter)

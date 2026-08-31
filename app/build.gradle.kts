@@ -34,4 +34,9 @@ dependencies {
     implementation(project(":platform:android"))
     implementation(platform(libs.compose.bom))
     implementation(libs.activity.compose)
+
+    androidTestImplementation(platform(libs.compose.bom))
+    androidTestImplementation(libs.compose.ui.test.junit4)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.junit4)
 }

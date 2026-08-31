@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -153,15 +154,22 @@ private fun RootNavigation(navigation: NavHostController) {
 }
 
 @Composable
-internal fun NavigationAction(label: String, contentDescription: String, onClick: () -> Unit) {
-    BasicText(
+internal fun NavigationAction(
+    label: String,
+    contentDescription: String,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    CockpitText(
         text = label,
-        modifier = Modifier
+        action = true,
+        modifier = modifier
             .semantics {
                 this.contentDescription = contentDescription
                 role = Role.Button
             }
             .clickable(onClick = onClick)
+            .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
             .padding(8.dp),
     )
 }

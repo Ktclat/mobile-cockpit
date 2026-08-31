@@ -39,6 +39,7 @@ dependencies {
     implementation(libs.compose.ui)
     implementation(libs.compose.foundation)
     implementation(libs.navigation.compose)
+    implementation(libs.coroutines.core)
 
     testImplementation(project(":platform:android"))
     testImplementation(project(":core:domain"))

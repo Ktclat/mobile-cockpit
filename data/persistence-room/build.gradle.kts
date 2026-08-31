@@ -8,8 +8,8 @@ kotlin {
 }
 
 dependencies {
-    implementation(project(":data:persistence-api"))
-    implementation(project(":core:domain"))
+    api(project(":data:persistence-api"))
+    api(project(":core:domain"))
     implementation(libs.room.runtime)
     implementation(libs.sqlite.bundled)
     ksp(libs.room.compiler)

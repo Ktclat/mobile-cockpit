@@ -11,7 +11,12 @@ class MainActivity : ComponentActivity() {
 
         val component = (application as CockpitApplication).processComponent
         setContent {
-            CockpitRoot(appName = component.shellAppName)
+            CockpitRoot(
+                appName = component.shellAppName,
+                agentApplicationPortHandle = component.agentApplicationPortHandle,
+                conversationApplicationPortHandle = component.conversationApplicationPortHandle,
+                agentConversationQueryPortHandle = component.agentConversationQueryPortHandle,
+            )
         }
     }
 }

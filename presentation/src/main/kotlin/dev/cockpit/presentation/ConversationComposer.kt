@@ -1,7 +1,11 @@
 package dev.cockpit.presentation
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.text.BasicText
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -11,6 +15,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -19,6 +24,8 @@ import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.TextStyle
 import dev.cockpit.domain.conversation.ConversationMessageDestination
 import dev.cockpit.projection.model.ConversationProjection
 import kotlinx.coroutines.CancellationException
@@ -35,6 +42,7 @@ internal fun ConversationComposer(projection: ConversationProjection, agentName:
     var destination by remember(projection.id) { mutableStateOf(restored?.destination ?: projection.messageDestination) }
     var text by remember(projection.id) { mutableStateOf(restored?.text.orEmpty()) }
     var completed by remember(projection.id) { mutableStateOf<ConversationMessageDestination?>(null) }
+    var followAuthoritativeDestination by remember(projection.id) { mutableStateOf(false) }
     var inFlight by remember(projection.id) { mutableStateOf(false) }
     val actionGate = remember(projection.id) { ConversationActionGate() }
     fun tryBegin(): Boolean = actionGate.tryBegin().also { if (it) inFlight = true }
@@ -42,12 +50,28 @@ internal fun ConversationComposer(projection: ConversationProjection, agentName:
     var failedSave by remember(projection.id) { mutableStateOf(false) }
     var failedSend by remember(projection.id) { mutableStateOf(false) }
     var failedNavigation by remember(projection.id) { mutableStateOf(false) }
-    LaunchedEffect(projection.messageDestination, completed) { if (completed != null && projection.messageDestination != completed) { destination = projection.messageDestination; text = ""; completed = null } }
+    var draftSaved by remember(projection.id) { mutableStateOf(false) }
+    LaunchedEffect(projection.messageDestination, completed, followAuthoritativeDestination) {
+        if (
+            followAuthoritativeDestination &&
+            text.isEmpty() &&
+            destination != projection.messageDestination
+        ) {
+            destination = projection.messageDestination
+            completed = null
+        }
+    }
     val scope = rememberCoroutineScope()
+    val focusManager = LocalFocusManager.current
     val stale = destination != projection.messageDestination
-    fun action(label: String, description: String, enabled: Boolean, click: () -> Unit) = Modifier.semantics { contentDescription = description; role = Role.Button; if (!enabled) disabled() }.then(if (enabled) Modifier.clickable(onClick = click) else Modifier)
+    fun action(description: String, enabled: Boolean, click: () -> Unit) = Modifier
+        .semantics { contentDescription = description; role = Role.Button; if (!enabled) disabled() }
+        .then(if (enabled) Modifier.clickable(onClick = click) else Modifier)
+        .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+        .padding(8.dp)
     val enabled = !invalid && !inFlight
-    BasicText("Back", action("Back", "Navigate up", enabled) {
+    Column {
+    CockpitText("Back", action("Navigate up", enabled) {
         val actionDestination = destination
         val actionText = text
         if (tryBegin()) {
@@ -76,26 +100,57 @@ internal fun ConversationComposer(projection: ConversationProjection, agentName:
             }
         }
     })
-    if (invalid) { BasicText("Composer destination is invalid. Actions are disabled.", Modifier.semantics { liveRegion=LiveRegionMode.Polite }); BasicText("Save draft", action("", "Save draft", false){}); BasicText("Send", action("", "Send message", false){}); return }
-    BasicTextField(text, { text=it }, Modifier.semantics { contentDescription="Compose message for $agentName" })
-    BasicText("Save draft", action("", "Save draft", enabled) {
+    if (invalid) {
+        CockpitText("Composer destination is invalid. Actions are disabled.", Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+        CockpitText("Save draft", action("Save draft", false) {})
+        CockpitText("Send", action("Send message", false) {})
+        return@Column
+    }
+    val palette = LocalCockpitPalette.current
+    BasicTextField(
+        value = text,
+        onValueChange = {
+            text = it
+            followAuthoritativeDestination = false
+            draftSaved = false
+            failedSave = false
+            failedSend = false
+        },
+        modifier = Modifier
+            .fillMaxWidth()
+            .sizeIn(minHeight = 48.dp)
+            .background(palette.field)
+            .semantics { contentDescription = "Compose message for $agentName" }
+            .padding(8.dp),
+        textStyle = TextStyle(color = palette.foreground),
+        cursorBrush = SolidColor(palette.action),
+    )
+    CockpitText("Save draft", action("Save draft", enabled) {
         val actionDestination = destination
         val actionText = text
         if (tryBegin()) scope.launch {
             try {
-                if (!actionGate.finishAfter { onSaveDraft(actionDestination, actionText) }) failedSave = true
+                if (actionGate.finishAfter { onSaveDraft(actionDestination, actionText) }) {
+                    draftSaved = true
+                    failedSave = false
+                } else {
+                    draftSaved = false
+                    failedSave = true
+                }
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {
+                draftSaved = false
                 failedSave = true
             } finally {
                 inFlight = false
             }
         }
     })
-    if (failedSave) BasicText("Draft could not be saved. Text is preserved.", Modifier.semantics { liveRegion=LiveRegionMode.Polite })
+    if (draftSaved) CockpitText("Draft saved", Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+    if (failedSave) CockpitText("Draft could not be saved. Text is preserved.", Modifier.semantics { liveRegion = LiveRegionMode.Polite })
     val sendEnabled = enabled && !stale && completed == null
-    BasicText("Send", action("", "Send message", sendEnabled) {
+    CockpitText("Send", action("Send message", sendEnabled) {
         val actionDestination = destination
         val actionText = text
         if (tryBegin()) scope.launch {
@@ -103,6 +158,9 @@ internal fun ConversationComposer(projection: ConversationProjection, agentName:
                 if (actionGate.finishAfter { onSendMessage(actionDestination, actionText) }) {
                     text = ""
                     completed = actionDestination
+                    followAuthoritativeDestination = true
+                    failedSend = false
+                    focusManager.clearFocus()
                 } else failedSend = true
             } catch (error: CancellationException) {
                 throw error
@@ -113,9 +171,10 @@ internal fun ConversationComposer(projection: ConversationProjection, agentName:
             }
         }
     })
-    if (failedSend) BasicText("Message could not be sent. Text is preserved.", Modifier.semantics { liveRegion=LiveRegionMode.Polite })
-    if (failedNavigation) BasicText("Navigation could not complete.", Modifier.semantics { liveRegion=LiveRegionMode.Polite })
-    if (stale) BasicText("Draft destination is stale. Send is disabled.", Modifier.semantics { liveRegion=LiveRegionMode.Polite })
+    if (failedSend) CockpitText("Message could not be sent. Text is preserved.", Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+    if (failedNavigation) CockpitText("Navigation could not complete.", Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+    if (stale) CockpitText("Draft destination is stale. Send is disabled.", Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+    }
 }
 
 internal class ConversationActionGate {

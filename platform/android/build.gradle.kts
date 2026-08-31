@@ -20,6 +20,10 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+    }
 }
 
 dependencies {
@@ -34,4 +38,10 @@ dependencies {
     implementation(project(":data:persistence-room"))
     implementation(project(":data:projection"))
     implementation(project(":platform:background"))
+    implementation(libs.room.runtime)
+    implementation(libs.sqlite.bundled)
+    implementation(libs.coroutines.core)
+
+    testImplementation(libs.junit4)
+    testImplementation(libs.robolectric)
 }
