@@ -20,7 +20,8 @@ import okhttp3.RequestBody.Companion.toRequestBody
 
 class OpenAiCompatibleAdapter(
     override val kind: ProviderKind,
-    private val client: OkHttpClient = OkHttpClient(),
+    private val streamingClient: OkHttpClient = OkHttpClient(),
+    private val serviceClient: OkHttpClient = streamingClient,
 ) : ProviderAdapter {
     init {
         require(kind == ProviderKind.OPENAI_RESPONSES || kind == ProviderKind.OPENAI_COMPATIBLE)
@@ -28,6 +29,13 @@ class OpenAiCompatibleAdapter(
 
     private val json = Json { ignoreUnknownKeys = true }
     private val calls = ConcurrentHashMap<ProviderInvocationId, okhttp3.Call>()
+    override val promptCapabilities = ProviderPromptCapabilities(
+        if (kind == ProviderKind.OPENAI_RESPONSES) {
+            PromptPlacementSupport.NATIVE
+        } else {
+            PromptPlacementSupport.COMPATIBILITY_DEPENDENT
+        },
+    )
 
     override suspend fun probe(
         profile: ProviderProfile,
@@ -61,7 +69,7 @@ class OpenAiCompatibleAdapter(
             return@withContext ProviderModelDiscoveryResult.Unavailable(authMissing())
         }
         try {
-            client.newCall(builder.build()).execute().use { response ->
+            serviceClient.newCall(builder.build()).execute().use { response ->
                 if (response.isSuccessful) {
                     val payload = response.readBoundedBody(MAX_MODEL_LIST_BODY_BYTES)
                         ?: return@use ProviderModelDiscoveryResult.Unavailable(
@@ -114,7 +122,7 @@ class OpenAiCompatibleAdapter(
             return@flow
         }
 
-        val call = client.newCall(builder.build())
+        val call = streamingClient.newCall(builder.build())
         calls[request.invocationId] = call
         try {
             call.execute().use { response ->

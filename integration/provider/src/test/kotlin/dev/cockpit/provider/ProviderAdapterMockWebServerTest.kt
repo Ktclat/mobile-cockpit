@@ -16,6 +16,7 @@ import dev.cockpit.provider.api.ProviderModelDiscoveryResult
 import dev.cockpit.provider.api.ProviderProfile
 import dev.cockpit.provider.api.ProviderProfileId
 import dev.cockpit.provider.api.ProviderStreamEvent
+import dev.cockpit.provider.api.PromptPlacementSupport
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
@@ -37,6 +38,7 @@ import okhttp3.tls.HandshakeCertificates
 import okhttp3.tls.HeldCertificate
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertInstanceOf
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
@@ -154,13 +156,16 @@ class ProviderAdapterMockWebServerTest {
         assertEquals("leading system", body["system"]?.jsonPrimitive?.content)
         assertMessageOrder(
             messages,
-            listOf("user", "assistant", "user", "user"),
+            listOf("user", "assistant", "user"),
             listOf(
                 "example question",
                 "example answer",
-                "real history",
-                "<post_history_instruction>\nafter history\n</post_history_instruction>",
+                "real history\n\n<post_history_instruction>\nafter history\n</post_history_instruction>",
             ),
+        )
+        assertEquals(
+            PromptPlacementSupport.DEGRADED_TO_USER,
+            adapter.promptCapabilities.postHistorySystemPlacement,
         )
         assertEquals("anthropic", (events[0] as ProviderStreamEvent.TextDelta).text)
         assertEquals(9L, (events[1] as ProviderStreamEvent.Completed).usage?.totalTokens)
@@ -187,6 +192,89 @@ class ProviderAdapterMockWebServerTest {
             assertEquals(expected, failed.error.code)
             assertEquals(status, failed.error.httpStatus)
         }
+    }
+
+    @Test
+    fun authorizationMaterialNeverAppearsInSafeHttpError() = runBlocking {
+        server.enqueue(
+            MockResponse.Builder()
+                .code(401)
+                .body("{\"error\":\"Bearer secret must not leak\"}")
+                .build(),
+        )
+        val failed = OpenAiCompatibleAdapter(ProviderKind.OPENAI_COMPATIBLE, client)
+            .startInvocation(request(ProviderKind.OPENAI_COMPATIBLE), authorization())
+            .toList()
+            .single() as ProviderStreamEvent.Failed
+
+        assertEquals(ProviderErrorCode.AUTH, failed.error.code)
+        assertFalse(failed.error.safeMessage.contains("secret", ignoreCase = true))
+        assertFalse(failed.error.safeMessage.contains("Bearer", ignoreCase = true))
+    }
+
+    @Test
+    fun anthropicAddsPostHistoryUserBlockAfterAssistantHistory() = runBlocking {
+        server.enqueue(sseResponse("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+        val request = request(ProviderKind.ANTHROPIC).copy(
+            messages = listOf(ProviderMessage(ProviderMessageRole.ASSISTANT, "last assistant")),
+        )
+
+        AnthropicAdapter(client).startInvocation(request, authorization("x-api-key")).toList()
+        val recorded = requireNotNull(server.takeRequest(5, TimeUnit.SECONDS))
+        val messages = json.parseToJsonElement(requireNotNull(recorded.body).utf8())
+            .jsonObject["messages"]!!.jsonArray
+
+        assertMessageOrder(
+            messages,
+            listOf("user", "assistant", "assistant", "user"),
+            listOf(
+                "example question",
+                "example answer",
+                "last assistant",
+                "<post_history_instruction>\nafter history\n</post_history_instruction>",
+            ),
+        )
+    }
+
+    @Test
+    fun streamingAndDiscoveryClientsUseSeparateBoundedPolicies() {
+        val streaming = ProviderHttpClientPolicy.streaming()
+        val discovery = ProviderHttpClientPolicy.discoveryAndProbe()
+
+        assertEquals(20_000, streaming.connectTimeoutMillis)
+        assertEquals(300_000, streaming.readTimeoutMillis)
+        assertEquals(0, streaming.callTimeoutMillis)
+        assertFalse(streaming.retryOnConnectionFailure)
+        assertFalse(streaming.followRedirects)
+        assertFalse(streaming.followSslRedirects)
+        assertEquals(20_000, discovery.connectTimeoutMillis)
+        assertEquals(60_000, discovery.readTimeoutMillis)
+        assertEquals(90_000, discovery.callTimeoutMillis)
+    }
+
+    @Test
+    fun unknownEventsAreIgnoredUntilKnownTerminalAndOversizedEventsFailSafely() = runBlocking {
+        val adapter = OpenAiCompatibleAdapter(ProviderKind.OPENAI_COMPATIBLE, client)
+        server.enqueue(
+            sseResponse(
+                "event: vendor.keepalive\ndata: {\"type\":\"vendor.keepalive\"}\n\n" +
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n" +
+                    "data: [DONE]\n\n",
+            ),
+        )
+        val events = adapter.startInvocation(
+            request(ProviderKind.OPENAI_COMPATIBLE, "unknown-event"),
+            authorization(),
+        ).toList()
+        assertEquals("ok", (events.first() as ProviderStreamEvent.TextDelta).text)
+        assertInstanceOf(ProviderStreamEvent.Completed::class.java, events.last())
+
+        server.enqueue(sseResponse("data: ${"x".repeat(262_145)}\n\n"))
+        val oversized = adapter.startInvocation(
+            request(ProviderKind.OPENAI_COMPATIBLE, "oversized-event"),
+            authorization(),
+        ).toList().single() as ProviderStreamEvent.Failed
+        assertEquals(ProviderErrorCode.MALFORMED_STREAM, oversized.error.code)
     }
 
     @Test

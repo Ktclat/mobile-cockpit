@@ -16,6 +16,7 @@ enum class ArchiveState { ACTIVE, ARCHIVED }
 enum class MessageRole { USER, AGENT, SYSTEM }
 enum class MessageSource { USER, DEBUG, RUNTIME }
 enum class MessageStatus { ACCEPTED, DELIVERED, FAILED }
+enum class GenerationAttemptStatus { STARTED, COMPLETED, FAILED, CANCELLED, INTERRUPTED }
 
 data class PersonaPersistenceState(val id: String, val persona: Persona)
 data class AgentPersistenceState(
@@ -45,6 +46,18 @@ data class ConversationSnapshot(
     val conversation: ConversationPersistenceState,
     val messages: List<MessagePersistenceState>,
     val drafts: List<Draft>,
+)
+data class GenerationAttemptPersistenceState(
+    val attemptId: String,
+    val conversationId: ConversationId,
+    val providerProfileId: String,
+    val modelId: String,
+    val providerRevision: Long,
+    val acceptedUserRevision: Long,
+    val status: GenerationAttemptStatus,
+    val errorCode: String?,
+    val createdAtEpochMillis: Long,
+    val updatedAtEpochMillis: Long,
 )
 data class AgentReadFact(val persona: PersonaPersistenceState, val agent: AgentPersistenceState)
 data class AgentDetailReadFact(val agent: AgentReadFact, val conversations: List<ConversationSnapshot>)
@@ -86,4 +99,18 @@ interface AgentConversationReadRepository {
 interface ConversationRepository : AgentConversationReadRepository {
     suspend fun save(snapshot: ConversationSnapshot)
     suspend fun load(conversationId: ConversationId): ConversationSnapshot?
+}
+
+interface GenerationAttemptRepository {
+    fun observeGenerationAttempt(conversationId: ConversationId): Flow<GenerationAttemptPersistenceState?>
+    suspend fun loadGenerationAttempt(conversationId: ConversationId): GenerationAttemptPersistenceState?
+    suspend fun startGenerationAttempt(attempt: GenerationAttemptPersistenceState): Boolean
+    suspend fun finishGenerationAttempt(
+        conversationId: ConversationId,
+        attemptId: String,
+        status: GenerationAttemptStatus,
+        errorCode: String?,
+        updatedAtEpochMillis: Long,
+    ): Boolean
+    suspend fun interruptStartedGenerationAttempts(updatedAtEpochMillis: Long): Int
 }

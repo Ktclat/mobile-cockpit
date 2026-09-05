@@ -136,11 +136,23 @@ data class ProviderSettingsSnapshot(
     val globalDefaultRoute: ProviderModelRouteView? = null,
 )
 
+enum class ProviderOperationCode {
+    SUCCEEDED,
+    FAILED,
+    PROVIDER_CONFIG_TRANSACTION_FAILED,
+    PROVIDER_CREDENTIAL_CLEANUP_PENDING,
+}
+
 data class ProviderOperationResult(
     val success: Boolean,
     val message: String,
     val profileId: String? = null,
     val modelId: String? = null,
+    val code: ProviderOperationCode = if (success) {
+        ProviderOperationCode.SUCCEEDED
+    } else {
+        ProviderOperationCode.FAILED
+    },
 )
 
 interface ProviderSettingsPort {

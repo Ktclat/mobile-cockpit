@@ -17,20 +17,24 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.List
 import androidx.compose.material.icons.outlined.AccountCircle
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -77,6 +81,7 @@ internal fun LiveConversation(
     val agentName = detail?.name ?: "Agent"
     val conversations = detail?.conversations.orEmpty()
     var switcherOpen by remember(current.id) { mutableStateOf(false) }
+    var migrationConfirmationOpen by remember(current.id) { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     val configureProvider = { navigation.navigate(LiveRoute.Models) }
@@ -103,7 +108,7 @@ internal fun LiveConversation(
         Unit
     }
     val migrateProviderRoute = {
-        scope.launch { actions.migrateProviderRoute(current.id) }
+        migrationConfirmationOpen = true
         Unit
     }
 
@@ -160,6 +165,90 @@ internal fun LiveConversation(
             onBack = { navigation.navigateUp() },
             composer = null,
         )
+    }
+
+    if (migrationConfirmationOpen) {
+        ProviderRouteMigrationDialog(
+            projection = current,
+            onDismiss = { migrationConfirmationOpen = false },
+            onConfirm = {
+                migrationConfirmationOpen = false
+                scope.launch { actions.migrateProviderRoute(current.id) }
+            },
+        )
+    }
+}
+
+@Composable
+private fun ProviderRouteMigrationDialog(
+    projection: ConversationProjection,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    val translator = LocalCockpitTranslator.current
+    val provider = projection.provider ?: return
+    val acceptingRevision =
+        projection.providerRouteState == ConversationProviderRouteState.REVISION_MISMATCH
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                translator.text(
+                    if (acceptingRevision) "API configuration changed" else "API configuration not bound",
+                ),
+            )
+        },
+        text = {
+            Column(
+                Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    translator.choose(
+                        "This conversation contains existing history. After confirmation, future requests may send that history to the target below. This action only updates the conversation binding and does not send a message.",
+                        "此会话包含已有历史。确认后，后续请求可能会把这些历史发送到下方目标。此操作只更新会话绑定，不会自动发送消息。",
+                    ),
+                )
+                MigrationTargetRow(translator.choose("API configuration", "API 配置"), provider.displayName)
+                MigrationTargetRow(translator.choose("Provider", "服务商"), provider.vendor)
+                MigrationTargetRow(translator.choose("Target host", "目标主机"), provider.endpointOrigin)
+                MigrationTargetRow(translator.choose("Protocol", "协议"), provider.protocol)
+                MigrationTargetRow(translator.choose("Model", "模型"), provider.model)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text(
+                    translator.choose(
+                        if (acceptingRevision) {
+                            "Accept the updated API configuration"
+                        } else {
+                            "Bind this API configuration"
+                        },
+                        if (acceptingRevision) {
+                            "接受此 API 配置的新版本"
+                        } else {
+                            "绑定此 API 配置"
+                        },
+                    ),
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(translator.choose("Cancel", "取消")) }
+        },
+    )
+}
+
+@Composable
+private fun MigrationTargetRow(label: String, value: String) {
+    Column {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(value, style = MaterialTheme.typography.bodyMedium)
     }
 }
 
@@ -380,7 +469,7 @@ private fun ConversationTimeline(
                             title = "API configuration changed",
                             body = "This conversation's bound API configuration has changed.",
                             tone = StatusTone.Warning,
-                            actionLabel = "Migrate this conversation to the current configuration",
+                            actionLabel = "Accept the updated API configuration",
                             onAction = onMigrateProviderRoute,
                         )
                     projection.providerRouteState == ConversationProviderRouteState.MISSING && provider != null ->
@@ -392,10 +481,10 @@ private fun ConversationTimeline(
                             onAction = onMigrateProviderRoute,
                         )
                     providerError != null -> InfoBanner(
-                        title = if (providerError.code == "CANCELLED") {
-                            "Response stopped"
-                        } else {
-                            "Provider response failed"
+                        title = when (providerError.code) {
+                            "CANCELLED" -> "Response stopped"
+                            "GENERATION_INTERRUPTED" -> "Response interrupted"
+                            else -> "Provider response failed"
                         },
                         body = providerError.message,
                         tone = StatusTone.Warning,

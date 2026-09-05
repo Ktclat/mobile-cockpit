@@ -8,7 +8,11 @@ import dev.cockpit.domain.AgentId
 import dev.cockpit.domain.ConversationId
 import dev.cockpit.domain.ConversationRevision
 import dev.cockpit.domain.conversation.ConversationMessageDestination
+import dev.cockpit.domain.time.AppClock
 import dev.cockpit.persistence.api.ConversationRepository
+import dev.cockpit.persistence.api.GenerationAttemptPersistenceState
+import dev.cockpit.persistence.api.GenerationAttemptRepository
+import dev.cockpit.persistence.api.GenerationAttemptStatus
 import dev.cockpit.persistence.api.MessageRole
 import dev.cockpit.persistence.api.MessageSource
 import dev.cockpit.persistence.api.ProviderConfigurationRepository
@@ -19,6 +23,8 @@ import dev.cockpit.projection.model.AgentDetailProjection
 import dev.cockpit.projection.model.BoundProviderProjection
 import dev.cockpit.projection.model.ConversationProjection
 import dev.cockpit.projection.model.ConversationProviderRouteState
+import dev.cockpit.projection.model.GenerationAttemptProjection
+import dev.cockpit.projection.model.GenerationAttemptProjectionStatus
 import dev.cockpit.projection.model.HomeProjection
 import dev.cockpit.projection.model.MessageRoleProjection
 import dev.cockpit.projection.model.MessageSourceProjection
@@ -36,11 +42,13 @@ import dev.cockpit.provider.api.ProviderMessageRole
 import dev.cockpit.provider.api.ProviderStreamEvent
 import dev.cockpit.runtime.coordinator.ProviderInvocationGate
 import java.util.UUID
+import java.net.URI
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
@@ -63,22 +71,38 @@ private data class ActiveProviderInvocation(
 
 internal class ProviderConversationRuntime(
     private val conversations: ConversationRepository,
+    private val generationAttempts: GenerationAttemptRepository,
     private val providers: ProviderConfigurationRepository,
     private val invocationGate: ProviderInvocationGate,
     private val appendAgentMessage: AppendConversationAgentMessage,
     private val mutations: ConversationMutationCoordinator,
     private val processScope: CoroutineScope,
+    private val clock: AppClock,
 ) {
     val replies = MutableStateFlow<Map<ConversationId, ProviderReplyState>>(emptyMap())
     private val active = ConcurrentHashMap<ConversationId, ActiveProviderInvocation>()
+    private val recovery = processScope.async(start = CoroutineStart.LAZY) {
+        generationAttempts.interruptStartedGenerationAttempts(clock.now().epochMilliseconds)
+    }
+
+    init {
+        recovery.start()
+    }
 
     fun hasActive(conversationId: ConversationId): Boolean = active.containsKey(conversationId)
 
+    suspend fun hasPersistedActive(conversationId: ConversationId): Boolean {
+        recovery.await()
+        return generationAttempts.loadGenerationAttempt(conversationId)?.status ==
+            GenerationAttemptStatus.STARTED
+    }
+
     suspend fun startAfterAccepted(
         destination: ConversationMessageDestination,
-    ) {
-        if (active.containsKey(destination.conversationId)) return
-        val snapshot = conversations.load(destination.conversationId) ?: return
+    ): Boolean {
+        recovery.await()
+        if (active.containsKey(destination.conversationId)) return false
+        val snapshot = conversations.load(destination.conversationId) ?: return false
         val resolution = providers.resolveConversationRoute(
             destination.conversationId,
             snapshot.conversation.conversation.agentId,
@@ -91,7 +115,7 @@ internal class ProviderConversationRuntime(
                     ProviderErrorCode.MODEL_ROUTE_REVISION_MISMATCH,
                     "This conversation's bound API configuration has changed. Migrate it explicitly before sending.",
                 )
-                return
+                return false
             }
             ConversationProviderRouteResolution.Missing -> {
                 showRouteError(
@@ -99,7 +123,7 @@ internal class ProviderConversationRuntime(
                     ProviderErrorCode.MODEL_ROUTE_MISSING,
                     "Choose an enabled API account and model before sending.",
                 )
-                return
+                return false
             }
         }
         val profile = runCatching { persistedProfile.toProviderProfile() }.getOrNull()
@@ -114,10 +138,11 @@ internal class ProviderConversationRuntime(
                     retryable = false,
                 ),
             )
-            return
+            return false
         }
+        val invocationId = ProviderInvocationId(UUID.randomUUID().toString())
         val request = NormalizedProviderRequest(
-            invocationId = ProviderInvocationId(UUID.randomUUID().toString()),
+            invocationId = invocationId,
             profile = profile,
             promptPlan = AgentPromptPlanner.build(
                 persona = snapshot.persona.persona,
@@ -134,30 +159,69 @@ internal class ProviderConversationRuntime(
                 )
             },
         )
-        launchProvider(destination, request)
+        val now = clock.now().epochMilliseconds
+        val started = runCatching {
+            generationAttempts.startGenerationAttempt(
+                GenerationAttemptPersistenceState(
+                    attemptId = invocationId.value,
+                    conversationId = destination.conversationId,
+                    providerProfileId = resolution.route.providerProfileId,
+                    modelId = resolution.route.modelId,
+                    providerRevision = resolution.route.requestRevision,
+                    acceptedUserRevision = snapshot.conversation.conversation.revision.value,
+                    status = GenerationAttemptStatus.STARTED,
+                    errorCode = null,
+                    createdAtEpochMillis = now,
+                    updatedAtEpochMillis = now,
+                ),
+            )
+        }.getOrDefault(false)
+        if (!started) {
+            showError(
+                destination.conversationId,
+                invocationId,
+                persistedProfile.displayName,
+                ProviderError(
+                    ProviderErrorCode.UNKNOWN_PROVIDER_ERROR,
+                    "A response is already active, or its durable state could not be created.",
+                    retryable = true,
+                ),
+            )
+            return false
+        }
+        return launchProvider(destination, request)
     }
 
     suspend fun retry(conversationId: ConversationId): Boolean {
+        recovery.await()
         if (active.containsKey(conversationId)) return false
         val snapshot = conversations.load(conversationId) ?: return false
         val last = snapshot.messages.maxByOrNull { it.ordinal } ?: return false
         if (last.role != MessageRole.USER) return false
         val current = snapshot.conversation.conversation.revision.value
         if (current <= 0L) return false
-        startAfterAccepted(
+        return startAfterAccepted(
             ConversationMessageDestination(
                 conversationId,
                 ConversationRevision(current - 1L),
             ),
         )
-        return active.containsKey(conversationId)
     }
 
     suspend fun cancel(conversationId: ConversationId): Boolean {
+        recovery.await()
         var invocation: ActiveProviderInvocation? = null
         val accepted = mutations.submit(conversationId) {
             val current = active.remove(conversationId) ?: return@submit false
             invocation = current
+            runCatching {
+                recordTerminal(
+                    conversationId,
+                    current.invocationId,
+                    GenerationAttemptStatus.CANCELLED,
+                    ProviderErrorCode.CANCELLED,
+                )
+            }
             showError(
                 conversationId,
                 current.invocationId,
@@ -180,7 +244,7 @@ internal class ProviderConversationRuntime(
     private fun launchProvider(
         destination: ConversationMessageDestination,
         request: NormalizedProviderRequest,
-    ) {
+    ): Boolean {
         val conversationId = destination.conversationId
         val job = processScope.launch(start = CoroutineStart.LAZY) {
             val buffer = StringBuilder()
@@ -192,6 +256,12 @@ internal class ProviderConversationRuntime(
                         is ProviderStreamEvent.TextDelta -> {
                             if (event.text.length > MAX_STREAMED_REPLY_CHARACTERS - buffer.length) {
                                 invocationGate.cancel(request.profile.kind, request.invocationId)
+                                recordTerminal(
+                                    conversationId,
+                                    request.invocationId,
+                                    GenerationAttemptStatus.FAILED,
+                                    ProviderErrorCode.MALFORMED_STREAM,
+                                )
                                 release(conversationId, request.invocationId)
                                 showError(
                                     conversationId,
@@ -219,6 +289,12 @@ internal class ProviderConversationRuntime(
                         is ProviderStreamEvent.ToolProposalDelta -> Unit
                         is ProviderStreamEvent.Failed -> {
                             terminalEventReceived = true
+                            recordTerminal(
+                                conversationId,
+                                request.invocationId,
+                                GenerationAttemptStatus.FAILED,
+                                event.error.code,
+                            )
                             release(conversationId, request.invocationId)
                             showError(
                                 conversationId,
@@ -231,6 +307,12 @@ internal class ProviderConversationRuntime(
                         is ProviderStreamEvent.Completed -> {
                             terminalEventReceived = true
                             if (buffer.isEmpty()) {
+                                recordTerminal(
+                                    conversationId,
+                                    request.invocationId,
+                                    GenerationAttemptStatus.FAILED,
+                                    ProviderErrorCode.MALFORMED_STREAM,
+                                )
                                 release(conversationId, request.invocationId)
                                 showError(
                                     conversationId,
@@ -253,13 +335,38 @@ internal class ProviderConversationRuntime(
                                             MessageSource.RUNTIME,
                                         )
                                         if (appended) {
+                                            val completedRecorded = recordTerminal(
+                                                conversationId,
+                                                request.invocationId,
+                                                GenerationAttemptStatus.COMPLETED,
+                                                null,
+                                            )
                                             release(conversationId, request.invocationId)
-                                            replies.update { it - conversationId }
+                                            if (completedRecorded) {
+                                                replies.update { it - conversationId }
+                                            } else {
+                                                showError(
+                                                    conversationId,
+                                                    request.invocationId,
+                                                    request.profile.displayName,
+                                                    ProviderError(
+                                                        ProviderErrorCode.UNKNOWN_PROVIDER_ERROR,
+                                                        "The reply was saved, but its generation status could not be finalized.",
+                                                        retryable = false,
+                                                    ),
+                                                )
+                                            }
                                         }
                                         appended
                                     }
                                 }
-                                if (!saved) {
+                                if (!saved && isCurrent(conversationId, request.invocationId)) {
+                                    recordTerminal(
+                                        conversationId,
+                                        request.invocationId,
+                                        GenerationAttemptStatus.FAILED,
+                                        ProviderErrorCode.UNKNOWN_PROVIDER_ERROR,
+                                    )
                                     release(conversationId, request.invocationId)
                                     showError(
                                         conversationId,
@@ -278,6 +385,12 @@ internal class ProviderConversationRuntime(
                     }
                 }
                 if (!terminalEventReceived && isCurrent(conversationId, request.invocationId)) {
+                    recordTerminal(
+                        conversationId,
+                        request.invocationId,
+                        GenerationAttemptStatus.FAILED,
+                        ProviderErrorCode.MALFORMED_STREAM,
+                    )
                     release(conversationId, request.invocationId)
                     showError(
                         conversationId,
@@ -308,6 +421,12 @@ internal class ProviderConversationRuntime(
                 }
             } catch (_: Exception) {
                 if (isCurrent(conversationId, request.invocationId)) {
+                    recordTerminal(
+                        conversationId,
+                        request.invocationId,
+                        GenerationAttemptStatus.FAILED,
+                        ProviderErrorCode.UNKNOWN_PROVIDER_ERROR,
+                    )
                     release(conversationId, request.invocationId)
                     showError(
                         conversationId,
@@ -338,10 +457,35 @@ internal class ProviderConversationRuntime(
                 error = null,
             )
             job.start()
+            return true
         } else {
             job.cancel()
+            processScope.launch {
+                recordTerminal(
+                    conversationId,
+                    request.invocationId,
+                    GenerationAttemptStatus.FAILED,
+                    ProviderErrorCode.UNKNOWN_PROVIDER_ERROR,
+                )
+            }
+            return false
         }
     }
+
+    private suspend fun recordTerminal(
+        conversationId: ConversationId,
+        invocationId: ProviderInvocationId,
+        status: GenerationAttemptStatus,
+        errorCode: ProviderErrorCode?,
+    ): Boolean = runCatching {
+        generationAttempts.finishGenerationAttempt(
+            conversationId = conversationId,
+            attemptId = invocationId.value,
+            status = status,
+            errorCode = errorCode?.name,
+            updatedAtEpochMillis = clock.now().epochMilliseconds,
+        )
+    }.getOrDefault(false)
 
     private fun isCurrent(conversationId: ConversationId, invocationId: ProviderInvocationId): Boolean =
         active[conversationId]?.invocationId == invocationId
@@ -410,6 +554,7 @@ internal class ProviderAwareAgentConversationQueries(
     private val delegate: AgentConversationQueryPort,
     private val configurations: Flow<ProviderConfigurationSnapshot>,
     private val replies: Flow<Map<ConversationId, ProviderReplyState>>,
+    private val generationAttempts: GenerationAttemptRepository,
 ) : AgentConversationQueryPort {
     override fun home(): Flow<HomeProjection> = combine(delegate.home(), configurations) { home, config ->
         home.copy(
@@ -427,7 +572,12 @@ internal class ProviderAwareAgentConversationQueries(
         }
 
     override fun conversation(id: ConversationId): Flow<ConversationProjection> =
-        combine(delegate.conversation(id), configurations, replies) { conversation, config, replyMap ->
+        combine(
+            delegate.conversation(id),
+            configurations,
+            replies,
+            generationAttempts.observeGenerationAttempt(id),
+        ) { conversation, config, replyMap, attempt ->
             val reply = replyMap[id]
             val route = config.projectConversationRoute(id, conversation)
             conversation.copy(
@@ -445,8 +595,37 @@ internal class ProviderAwareAgentConversationQueries(
                 },
                 providerError = reply?.error?.let {
                     ProviderReplyErrorProjection(it.code.name, it.safeMessage, it.retryable)
+                } ?: attempt?.toPersistedError(),
+                generationAttempt = attempt?.let {
+                    GenerationAttemptProjection(
+                        attemptId = it.attemptId,
+                        status = GenerationAttemptProjectionStatus.valueOf(it.status.name),
+                        errorCode = it.errorCode,
+                    )
                 },
             )
+        }
+
+    private fun GenerationAttemptPersistenceState.toPersistedError(): ProviderReplyErrorProjection? =
+        when (status) {
+            GenerationAttemptStatus.INTERRUPTED -> ProviderReplyErrorProjection(
+                code = ProviderErrorCode.GENERATION_INTERRUPTED.name,
+                message = "The previous response did not finish after the app was interrupted.",
+                retryable = true,
+            )
+            GenerationAttemptStatus.FAILED -> ProviderReplyErrorProjection(
+                code = errorCode ?: ProviderErrorCode.UNKNOWN_PROVIDER_ERROR.name,
+                message = "The previous provider response failed before it could be saved.",
+                retryable = errorCode !in NON_RETRYABLE_PERSISTED_ERRORS,
+            )
+            GenerationAttemptStatus.CANCELLED -> ProviderReplyErrorProjection(
+                code = ProviderErrorCode.CANCELLED.name,
+                message = "The previous response was stopped. Partial text was not saved as a message.",
+                retryable = true,
+            )
+            GenerationAttemptStatus.STARTED,
+            GenerationAttemptStatus.COMPLETED,
+            -> null
         }
 
     private fun ProviderConfigurationSnapshot.projectConversationRoute(
@@ -466,13 +645,20 @@ internal class ProviderAwareAgentConversationQueries(
             )
         }
         val currentProfile = profiles.firstOrNull { it.id == lockedRoute.providerProfileId }
+        val currentRouteProfile = currentProfile?.let { profile ->
+            models.firstOrNull {
+                it.id == lockedRoute.modelId && it.connectionId == profile.id
+            }?.let { model ->
+                profile.copy(model = model.remoteModelId, preferredModelId = model.id) to false
+            }
+        }
         val resolved = resolvedRoute(
                 connectionId = lockedRoute.providerProfileId,
                 modelId = lockedRoute.modelId,
                 usesDefault = false,
             )
         return ConversationRouteProjection(
-            profile = resolved,
+            profile = resolved ?: currentRouteProfile,
             state = when {
                 currentProfile != null && currentProfile.revision != lockedRoute.requestRevision ->
                     ConversationProviderRouteState.REVISION_MISMATCH
@@ -515,13 +701,58 @@ internal class ProviderAwareAgentConversationQueries(
         available = lastProbedAtEpochMillis != null && lastProbeErrorCode == null,
         usesDefault = usesDefault,
         modelId = preferredModelId,
+        vendor = vendor.toProviderVendorLabel(),
+        protocol = kind.toProviderProtocolLabel(),
+        endpointOrigin = baseUrl.toEndpointOrigin(),
     )
 
     private data class ConversationRouteProjection(
         val profile: Pair<ProviderProfilePersistenceState, Boolean>?,
         val state: ConversationProviderRouteState,
     )
+
+    private companion object {
+        val NON_RETRYABLE_PERSISTED_ERRORS = setOf(
+            ProviderErrorCode.AUTH.name,
+            ProviderErrorCode.PERMISSION.name,
+            ProviderErrorCode.ENDPOINT.name,
+            ProviderErrorCode.MODEL_UNAVAILABLE.name,
+            ProviderErrorCode.PARAMETER_UNSUPPORTED.name,
+            ProviderErrorCode.INVALID_REQUEST.name,
+            ProviderErrorCode.CONTEXT_LIMIT.name,
+            ProviderErrorCode.CAPABILITY_UNSUPPORTED.name,
+            ProviderErrorCode.TLS_FAILURE.name,
+        )
+    }
 }
+
+private fun String.toProviderVendorLabel(): String = when (this) {
+    "OPENAI" -> "OpenAI"
+    "DEEPSEEK" -> "DeepSeek"
+    "GEMINI" -> "Gemini"
+    "GLM" -> "GLM"
+    "ANTHROPIC" -> "Anthropic"
+    else -> "Custom"
+}
+
+private fun String.toProviderProtocolLabel(): String = when (this) {
+    ProviderKind.OPENAI_RESPONSES.name -> "OpenAI Responses"
+    ProviderKind.ANTHROPIC.name -> "Anthropic Messages"
+    else -> "OpenAI Chat Completions"
+}
+
+private fun String.toEndpointOrigin(): String = runCatching {
+    val uri = URI(this)
+    buildString {
+        append(uri.scheme)
+        append("://")
+        append(uri.host)
+        if (uri.port >= 0) {
+            append(':')
+            append(uri.port)
+        }
+    }
+}.getOrDefault(this)
 
 private fun ConversationProjection.isSafeForInitialRouteBinding(): Boolean {
     val messages = timeline.mapNotNull { (it as? TimelineItemProjection.MessageItem)?.message }

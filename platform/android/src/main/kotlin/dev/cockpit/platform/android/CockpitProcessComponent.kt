@@ -47,6 +47,7 @@ import dev.cockpit.persistence.room.migration.Migration2To3
 import dev.cockpit.persistence.room.migration.Migration3To4
 import dev.cockpit.persistence.room.migration.Migration4To5
 import dev.cockpit.persistence.room.migration.Migration5To6
+import dev.cockpit.persistence.room.migration.Migration6To7
 import dev.cockpit.persistence.api.AgentDraftPersistenceState
 import dev.cockpit.persistence.api.ConversationProviderRouteResolution
 import dev.cockpit.provider.ProviderAdapterRegistry
@@ -93,6 +94,7 @@ class CockpitProcessComponent internal constructor(
                     Migration3To4,
                     Migration4To5,
                     Migration5To6,
+                    Migration6To7,
                 )
                 .build()
         },
@@ -141,11 +143,13 @@ class CockpitProcessComponent internal constructor(
     private val providerConversationRuntime by lazy {
         ProviderConversationRuntime(
             conversations = repository,
+            generationAttempts = repository,
             providers = providerRepository,
             invocationGate = providerInvocationGate,
             appendAgentMessage = appendAgentMessageUseCase,
             mutations = conversationMutations,
             processScope = mutationScope,
+            clock = clock,
         )
     }
     private val providerSettings: ProviderSettingsPort by lazy {
@@ -383,7 +387,10 @@ class CockpitProcessComponent internal constructor(
 
         override suspend fun sendMessage(destination: ConversationMessageDestination, text: String): Boolean {
             val result = conversationMutations.submit(destination.conversationId) {
-                if (providerConversationRuntime.hasActive(destination.conversationId)) {
+                if (
+                    providerConversationRuntime.hasActive(destination.conversationId) ||
+                    providerConversationRuntime.hasPersistedActive(destination.conversationId)
+                ) {
                     SendConversationMessageResult.Rejected
                 } else {
                     sendMessageUseCase(destination, text).also { result ->
@@ -418,6 +425,7 @@ class CockpitProcessComponent internal constructor(
             delegate = projectedQueries,
             configurations = providerRepository.observeConfiguration(),
             replies = providerConversationRuntime.replies,
+            generationAttempts = repository,
         )
     }
 

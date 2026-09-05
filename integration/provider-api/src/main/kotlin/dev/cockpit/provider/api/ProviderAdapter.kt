@@ -4,6 +4,8 @@ import kotlinx.coroutines.flow.Flow
 
 interface ProviderAdapter {
     val kind: ProviderKind
+    val promptCapabilities: ProviderPromptCapabilities
+        get() = ProviderPromptCapabilities(PromptPlacementSupport.COMPATIBILITY_DEPENDENT)
 
     suspend fun probe(
         profile: ProviderProfile,
@@ -22,6 +24,16 @@ interface ProviderAdapter {
 
     fun cancel(invocationId: ProviderInvocationId)
 }
+
+enum class PromptPlacementSupport {
+    NATIVE,
+    DEGRADED_TO_USER,
+    COMPATIBILITY_DEPENDENT,
+}
+
+data class ProviderPromptCapabilities(
+    val postHistorySystemPlacement: PromptPlacementSupport,
+)
 
 data class DiscoveredProviderModel(
     val remoteModelId: String,

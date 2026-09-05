@@ -150,6 +150,34 @@ data class ConversationProviderRouteEntity(
 )
 
 @Entity(
+    tableName = "generation_attempts",
+    foreignKeys = [
+        ForeignKey(
+            entity = ConversationEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["conversationId"],
+            onDelete = ForeignKey.CASCADE,
+        ),
+    ],
+    indices = [
+        Index(value = ["attemptId"], unique = true),
+        Index(value = ["status"]),
+    ],
+)
+data class GenerationAttemptEntity(
+    @PrimaryKey val conversationId: String,
+    val attemptId: String,
+    val providerProfileId: String,
+    val modelId: String,
+    val providerRevision: Long,
+    val acceptedUserRevision: Long,
+    val status: String,
+    val errorCode: String?,
+    val createdAtEpochMillis: Long,
+    val updatedAtEpochMillis: Long,
+)
+
+@Entity(
     tableName = "agent_definition_revisions",
     primaryKeys = ["agentId", "revision"],
     foreignKeys = [

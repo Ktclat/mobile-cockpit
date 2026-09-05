@@ -194,6 +194,7 @@ internal fun CreateAgentScreen(
                 modifier = Modifier.weight(1f),
                 profile = profile,
                 agents = agents,
+                providers = providers,
             )
         }
         CreationBottomBar(
@@ -870,6 +871,7 @@ private fun AgentPreviewStep(
     modifier: Modifier,
     profile: AgentProfileInput,
     agents: AgentApplicationPort,
+    providers: ProviderSettingsSnapshot,
 ) {
     val translator = LocalCockpitTranslator.current
     var messages by remember { mutableStateOf<List<AgentTestMessage>>(emptyList()) }
@@ -878,6 +880,29 @@ private fun AgentPreviewStep(
     var error by remember { mutableStateOf<String?>(null) }
     var previewJob by remember { mutableStateOf<Job?>(null) }
     val scope = rememberCoroutineScope()
+    val selectedProvider = profile.providerProfileId?.let { selectedId ->
+        providers.profiles.firstOrNull { it.id == selectedId }
+    } ?: providers.globalDefaultRoute?.connectionId?.let { defaultId ->
+        providers.profiles.firstOrNull { it.id == defaultId }
+    }
+    val postHistoryCompatibilityWarning = profile.postHistoryInstructions
+        .takeIf(String::isNotBlank)
+        ?.let {
+            when {
+                selectedProvider?.protocol == dev.cockpit.application.api.ProviderProtocol.ANTHROPIC_MESSAGES ->
+                    translator.choose(
+                        "This model interface cannot place a system instruction after history natively. Cockpit will append a marked compatibility block to user content, so semantics may differ slightly.",
+                        "当前模型接口无法原生表达“历史后系统指令”。Cockpit 会把带标记的兼容指令附加到用户内容，语义可能略有不同。",
+                    )
+                selectedProvider?.protocol == dev.cockpit.application.api.ProviderProtocol.OPENAI_CHAT_COMPLETIONS &&
+                    selectedProvider.vendor != dev.cockpit.application.api.ProviderVendor.OPENAI ->
+                    translator.choose(
+                        "This OpenAI-compatible endpoint may interpret a system instruction placed after history differently.",
+                        "此 OpenAI 兼容接口对“历史后系统指令”的解释可能不同。",
+                    )
+                else -> null
+            }
+        }
 
     LaunchedEffect(Unit) {
         if (profile.firstMessage.isNotBlank()) {
@@ -959,6 +984,15 @@ private fun AgentPreviewStep(
                         "${source.detectedSpec} · 保留 ${source.preservedFieldCount} 个扩展字段",
                     ),
                     tone = if (source.warnings.isEmpty()) StatusTone.Positive else StatusTone.Warning,
+                )
+            }
+        }
+        postHistoryCompatibilityWarning?.let { warning ->
+            item {
+                InfoBanner(
+                    title = translator.choose("Prompt compatibility", "提示词兼容性"),
+                    body = warning,
+                    tone = StatusTone.Warning,
                 )
             }
         }

@@ -21,11 +21,14 @@ import dev.cockpit.persistence.api.MessageStatus
 import dev.cockpit.persistence.api.PersonaPersistenceState
 import dev.cockpit.persistence.api.ProviderModelOptionPersistenceState
 import dev.cockpit.persistence.api.ProviderProfilePersistenceState
+import dev.cockpit.persistence.api.ProviderProfileMutation
+import androidx.sqlite.SQLiteException
 import java.nio.file.Path
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertInstanceOf
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 
@@ -130,6 +133,36 @@ class ProviderRouteRevisionTest {
             ConversationProviderRouteResolution.Ready::class.java,
             providers.resolveConversationRoute(CONVERSATION_ID, AGENT_ID),
         )
+    }
+
+    @Test
+    fun profileAndModelMutationRollsBackTogetherWhenModelWriteFails() = runBlocking {
+        val db = CockpitDatabase.open(temporaryDirectory.resolve("provider-atomic.db").toString())
+            .also { database = it }
+        val providers = RoomProviderConfigurationRepository(db)
+        val original = profile(revision = 4, baseUrl = "https://old.example/v1")
+        val originalModel = model()
+        providers.saveProfile(original)
+        providers.saveModel(originalModel)
+
+        val invalidModel = originalModel.copy(
+            id = "invalid-model",
+            connectionId = "missing-profile",
+            discoveryState = "STALE",
+        )
+        assertThrows(SQLiteException::class.java) {
+            runBlocking {
+                providers.saveProfileMutation(
+                    ProviderProfileMutation(
+                        original.copy(revision = 5, baseUrl = "https://new.example/v1"),
+                        listOf(invalidModel),
+                    ),
+                )
+            }
+        }
+
+        assertEquals(original, providers.loadProfile(original.id))
+        assertEquals(originalModel, providers.loadModel(originalModel.id))
     }
 
     private fun conversation(

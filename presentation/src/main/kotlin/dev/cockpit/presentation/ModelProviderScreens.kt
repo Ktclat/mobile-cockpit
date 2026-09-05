@@ -68,6 +68,7 @@ import dev.cockpit.application.api.ProviderCredentialUpdate
 import dev.cockpit.application.api.ProviderModelDiscoveryState
 import dev.cockpit.application.api.ProviderModelOptionView
 import dev.cockpit.application.api.ProviderModelRouteView
+import dev.cockpit.application.api.ProviderOperationCode
 import dev.cockpit.application.api.ProviderOperationResult
 import dev.cockpit.application.api.ProviderProbeState
 import dev.cockpit.application.api.ProviderProfileInput
@@ -197,14 +198,15 @@ internal fun LiveProviderSettings(
                 )
             }
             result?.let { operation ->
+                val needsAttention = operation.needsAttention
                 item {
                     InfoBanner(
                         title = translator.choose(
-                            if (operation.success) "Saved" else "Needs attention",
-                            if (operation.success) "已保存" else "需要处理",
+                            if (needsAttention) "Needs attention" else "Saved",
+                            if (needsAttention) "需要处理" else "已保存",
                         ),
                         body = operation.message,
-                        tone = if (operation.success) StatusTone.Positive else StatusTone.Warning,
+                        tone = if (needsAttention) StatusTone.Warning else StatusTone.Positive,
                     )
                 }
             }
@@ -467,14 +469,15 @@ internal fun LiveProviderVendorSettings(
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             result?.let { operation ->
+                val needsAttention = operation.needsAttention
                 item {
                     InfoBanner(
                         title = t.choose(
-                            if (operation.success) "Done" else "Needs attention",
-                            if (operation.success) "已完成" else "需要处理",
+                            if (needsAttention) "Needs attention" else "Done",
+                            if (needsAttention) "需要处理" else "已完成",
                         ),
                         body = operation.message,
-                        tone = if (operation.success) StatusTone.Positive else StatusTone.Warning,
+                        tone = if (needsAttention) StatusTone.Warning else StatusTone.Positive,
                     )
                 }
             }
@@ -917,11 +920,12 @@ internal fun LiveProviderConnectionEditor(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             result?.let { operation ->
+                val needsAttention = operation.needsAttention
                 item {
                     InfoBanner(
-                        title = t.choose(if (operation.success) "Done" else "Needs attention", if (operation.success) "已完成" else "需要处理"),
+                        title = t.choose(if (needsAttention) "Needs attention" else "Done", if (needsAttention) "需要处理" else "已完成"),
                         body = operation.message,
-                        tone = if (operation.success) StatusTone.Positive else StatusTone.Warning,
+                        tone = if (needsAttention) StatusTone.Warning else StatusTone.Positive,
                     )
                 }
             }
@@ -1438,6 +1442,9 @@ private fun finalEndpointPreview(prefix: String, protocol: ProviderProtocol, t: 
     }
     return t.choose("Final endpoint: ${prefix.trimEnd('/')}/$suffix", "最终端点：${prefix.trimEnd('/')}/$suffix")
 }
+
+private val ProviderOperationResult.needsAttention: Boolean
+    get() = !success || code == ProviderOperationCode.PROVIDER_CREDENTIAL_CLEANUP_PENDING
 
 private fun endpointHost(url: String): String = runCatching { URI(url).host }.getOrNull() ?: url
 

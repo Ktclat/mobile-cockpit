@@ -11,6 +11,7 @@ import dev.cockpit.application.api.ProviderProtocol
 import dev.cockpit.application.api.ProviderSettingsPort
 import dev.cockpit.application.api.ProviderVendor
 import dev.cockpit.persistence.room.CockpitDatabase
+import dev.cockpit.persistence.api.GenerationAttemptStatus
 import dev.cockpit.projection.model.ConversationProviderRouteState
 import dev.cockpit.projection.model.TimelineItemProjection
 import dev.cockpit.provider.api.ProviderAdapter
@@ -25,9 +26,11 @@ import dev.cockpit.provider.api.ProviderStreamEvent
 import dev.cockpit.provider.api.NormalizedProviderRequest
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -119,6 +122,10 @@ class CockpitProcessComponentMutationTest {
             listOf("hello", "agent reply"),
             final.timeline.map { (it as TimelineItemProjection.MessageItem).message.text },
         )
+        assertEquals(
+            GenerationAttemptStatus.COMPLETED.name,
+            checkNotNull(database).generationAttemptDao().forConversation(conversationId.value)?.status,
+        )
     }
 
     @Test
@@ -160,6 +167,135 @@ class CockpitProcessComponentMutationTest {
             failed.timeline.map { (it as TimelineItemProjection.MessageItem).message.text },
         )
         assertFalse(failed.streamingReply?.inProgress ?: false)
+        val attempt = checkNotNull(database).generationAttemptDao().forConversation(conversationId.value)
+        assertEquals(GenerationAttemptStatus.FAILED.name, attempt?.status)
+        assertEquals("MALFORMED_STREAM", attempt?.errorCode)
+    }
+
+    @Test
+    fun cancellingGenerationPersistsCancelledAndNeverSavesPartialReply() = runBlocking {
+        val adapter = StallingProviderAdapter()
+        val component = component(adapter)
+        val agents = component.agentApplicationPortHandle as AgentApplicationPort
+        val conversations = component.conversationApplicationPortHandle as ConversationApplicationPort
+        val queries = component.agentConversationQueryPortHandle as AgentConversationQueryPort
+        val settings = component.providerSettingsPortHandle as ProviderSettingsPort
+        val agentId = checkNotNull(agents.createAgent("Cancel agent"))
+        val profileId = checkNotNull(settings.saveProfile(
+            ProviderProfileInput(
+                displayName = "Cancel API",
+                vendor = ProviderVendor.CUSTOM,
+                baseUrl = "https://provider.example/v1",
+                protocol = ProviderProtocol.OPENAI_CHAT_COMPLETIONS,
+                apiKey = "secret",
+                credentialUpdate = ProviderCredentialUpdate.REPLACE,
+            ),
+        ).profileId)
+        val modelId = checkNotNull(settings.addModel(profileId, "test-model").modelId)
+        assertTrue(settings.bindAgent(agentId, profileId, modelId).success)
+        val conversationId = checkNotNull(conversations.createConversation(agentId))
+        val destination = withTimeout(5_000) {
+            queries.conversation(conversationId).first {
+                it.providerRouteState == ConversationProviderRouteState.READY
+            }.messageDestination
+        }
+
+        assertTrue(conversations.sendMessage(destination, "stop this"))
+        withTimeout(5_000) { adapter.started.await() }
+        assertTrue(conversations.cancelReply(conversationId))
+        val cancelled = withTimeout(5_000) {
+            queries.conversation(conversationId).first { it.providerError?.code == "CANCELLED" }
+        }
+
+        assertEquals(1, cancelled.timeline.size)
+        assertEquals(
+            GenerationAttemptStatus.CANCELLED.name,
+            checkNotNull(database).generationAttemptDao().forConversation(conversationId.value)?.status,
+        )
+        assertTrue(adapter.cancelCalled.get())
+    }
+
+    @Test
+    fun recreatingProcessMarksOrphanedAttemptInterruptedWithoutAutomaticRetry() = runBlocking {
+        val context = RuntimeEnvironment.getApplication()
+        val databaseName = "generation-recovery.db"
+        context.deleteDatabase(databaseName)
+        val firstDatabase = Room.databaseBuilder(context, CockpitDatabase::class.java, databaseName)
+            .setDriver(AndroidSQLiteDriver())
+            .build()
+        val firstScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val adapter = StallingProviderAdapter()
+        var secondDatabase: CockpitDatabase? = null
+        var secondScope: CoroutineScope? = null
+        try {
+            val firstComponent = CockpitProcessComponent(
+                databaseFactory = { firstDatabase },
+                mutationScope = firstScope,
+                providerAdapterResolver = { adapter },
+            )
+            val agents = firstComponent.agentApplicationPortHandle as AgentApplicationPort
+            val conversations = firstComponent.conversationApplicationPortHandle as ConversationApplicationPort
+            val queries = firstComponent.agentConversationQueryPortHandle as AgentConversationQueryPort
+            val settings = firstComponent.providerSettingsPortHandle as ProviderSettingsPort
+            val agentId = checkNotNull(agents.createAgent("Recovery agent"))
+            val profileId = checkNotNull(settings.saveProfile(
+                ProviderProfileInput(
+                    displayName = "Recovery API",
+                    vendor = ProviderVendor.CUSTOM,
+                    baseUrl = "https://provider.example/v1",
+                    protocol = ProviderProtocol.OPENAI_CHAT_COMPLETIONS,
+                    apiKey = "secret",
+                    credentialUpdate = ProviderCredentialUpdate.REPLACE,
+                ),
+            ).profileId)
+            val modelId = checkNotNull(settings.addModel(profileId, "test-model").modelId)
+            assertTrue(settings.bindAgent(agentId, profileId, modelId).success)
+            val conversationId = checkNotNull(conversations.createConversation(agentId))
+            val destination = withTimeout(5_000) {
+                queries.conversation(conversationId).first {
+                    it.providerRouteState == ConversationProviderRouteState.READY
+                }.messageDestination
+            }
+
+            assertTrue(conversations.sendMessage(destination, "survive process death"))
+            withTimeout(5_000) { adapter.started.await() }
+            assertEquals(
+                GenerationAttemptStatus.STARTED.name,
+                firstDatabase.generationAttemptDao().forConversation(conversationId.value)?.status,
+            )
+
+            firstScope.cancel()
+            firstDatabase.close()
+            secondDatabase = Room.databaseBuilder(context, CockpitDatabase::class.java, databaseName)
+                .setDriver(AndroidSQLiteDriver())
+                .build()
+            secondScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+            val secondComponent = CockpitProcessComponent(
+                databaseFactory = { checkNotNull(secondDatabase) },
+                mutationScope = secondScope,
+                providerAdapterResolver = { adapter },
+            )
+            val recoveredQueries = secondComponent.agentConversationQueryPortHandle as AgentConversationQueryPort
+            val recovered = withTimeout(5_000) {
+                recoveredQueries.conversation(conversationId).first {
+                    it.providerError?.code == "GENERATION_INTERRUPTED"
+                }
+            }
+
+            assertEquals(1, adapter.invocationCount.get())
+            assertEquals(1, recovered.timeline.size)
+            assertTrue(recovered.providerError?.retryable == true)
+            assertEquals(
+                GenerationAttemptStatus.INTERRUPTED.name,
+                checkNotNull(secondDatabase).generationAttemptDao().forConversation(conversationId.value)?.status,
+            )
+        } finally {
+            firstScope.cancel()
+            secondScope?.cancel()
+            runCatching { firstDatabase.close() }
+            runCatching { secondDatabase?.close() }
+            context.deleteDatabase(databaseName)
+        }
     }
 
     @Test
@@ -275,5 +411,43 @@ class CockpitProcessComponentMutationTest {
         override fun cancel(invocationId: dev.cockpit.provider.api.ProviderInvocationId) = Unit
 
         val invocationCount = AtomicInteger()
+    }
+
+    private class StallingProviderAdapter : ProviderAdapter {
+        override val kind = ProviderKind.OPENAI_COMPATIBLE
+        val started = CompletableDeferred<Unit>()
+        val invocationCount = AtomicInteger()
+        val cancelCalled = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        override suspend fun probe(
+            profile: ProviderProfile,
+            authorization: ProviderAuthorizationHandle,
+        ) = ProviderProbeResult.Available(
+            ProviderCapabilities(
+                ProviderCapabilitySupport.SUPPORTED,
+                ProviderCapabilitySupport.UNKNOWN,
+                0,
+                "test",
+            ),
+        )
+
+        override suspend fun discoverModels(
+            profile: ProviderProfile,
+            authorization: ProviderAuthorizationHandle,
+        ): ProviderModelDiscoveryResult = ProviderModelDiscoveryResult.Unsupported("not needed")
+
+        override fun startInvocation(
+            request: NormalizedProviderRequest,
+            authorization: ProviderAuthorizationHandle,
+        ): Flow<ProviderStreamEvent> = flow {
+            invocationCount.incrementAndGet()
+            emit(ProviderStreamEvent.TextDelta(request.invocationId, 0, "partial"))
+            started.complete(Unit)
+            awaitCancellation()
+        }
+
+        override fun cancel(invocationId: dev.cockpit.provider.api.ProviderInvocationId) {
+            cancelCalled.set(true)
+        }
     }
 }

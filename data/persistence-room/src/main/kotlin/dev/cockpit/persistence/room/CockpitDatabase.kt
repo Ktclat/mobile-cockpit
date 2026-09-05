@@ -9,7 +9,8 @@ import dev.cockpit.persistence.room.migration.Migration2To3
 import dev.cockpit.persistence.room.migration.Migration3To4
 import dev.cockpit.persistence.room.migration.Migration4To5
 import dev.cockpit.persistence.room.migration.Migration5To6
-import dev.cockpit.persistence.room.migration.SchemaV6
+import dev.cockpit.persistence.room.migration.Migration6To7
+import dev.cockpit.persistence.room.migration.SchemaV7
 
 @Database(
     entities = [
@@ -26,8 +27,9 @@ import dev.cockpit.persistence.room.migration.SchemaV6
         AgentDefinitionRevisionEntity::class,
         AgentImportSourceEntity::class,
         AgentDraftEntity::class,
+        GenerationAttemptEntity::class,
     ],
-    version = SchemaV6.VERSION,
+    version = SchemaV7.VERSION,
     exportSchema = true,
 )
 abstract class CockpitDatabase : RoomDatabase() {
@@ -44,6 +46,7 @@ abstract class CockpitDatabase : RoomDatabase() {
     abstract fun agentDefinitionRevisionDao(): AgentDefinitionRevisionDao
     abstract fun agentImportSourceDao(): AgentImportSourceDao
     abstract fun agentDraftDao(): AgentDraftDao
+    abstract fun generationAttemptDao(): GenerationAttemptDao
 
     companion object {
         fun open(path: String): CockpitDatabase = Room.databaseBuilder<CockpitDatabase>(name = path)
@@ -54,6 +57,7 @@ abstract class CockpitDatabase : RoomDatabase() {
                 Migration3To4,
                 Migration4To5,
                 Migration5To6,
+                Migration6To7,
             )
             .build()
     }

@@ -23,7 +23,9 @@ import dev.cockpit.persistence.api.MessageStatus
 import dev.cockpit.persistence.api.PersonaPersistenceState
 import androidx.sqlite.SQLiteException
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
+import androidx.sqlite.execSQL
 import androidx.room3.testing.MigrationTestHelper
+import dev.cockpit.persistence.room.migration.Migration6To7
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.take
@@ -192,6 +194,77 @@ class SchemaV1MigrationTest {
         runBlocking {
             helper.createDatabase(1).close()
             helper.runMigrationsAndValidate(1).close()
+        }
+    }
+
+    @Test
+    fun migrationSixToSevenPreservesExistingRoutesAndCreatesNoAttempts() = runBlocking {
+        val schema = Path.of("schemas", "dev.cockpit.persistence.room.CockpitDatabase", "6.json")
+        val helper = MigrationTestHelper(
+            schema.parent.parent,
+            temporaryDirectory.resolve("six-to-seven.db"),
+            BundledSQLiteDriver(),
+            CockpitDatabase::class,
+        )
+        helper.createDatabase(6).use { connection ->
+            connection.execSQL(
+                "INSERT INTO personas (id, identity, presentation, voice, behavioralTendency, promptStyle) VALUES ('persona-legacy', 'Legacy', '', '', '', '')",
+            )
+            connection.execSQL(
+                "INSERT INTO agents (id, personaId, capabilitySummary, revision, archiveState) VALUES ('agent-legacy', 'persona-legacy', 'chat', 3, 'ACTIVE')",
+            )
+            connection.execSQL(
+                "INSERT INTO conversations (id, agentId, revision, archiveState) VALUES ('conversation-legacy', 'agent-legacy', 8, 'ACTIVE')",
+            )
+            connection.execSQL(
+                """
+                INSERT INTO provider_profiles (
+                    id, displayName, kind, baseUrl, model, credentialReference,
+                    credentialRotation, maxOutputTokens, revision,
+                    streamingCapability, toolCapability
+                ) VALUES (
+                    'profile-legacy', 'Legacy API', 'OPENAI_COMPATIBLE',
+                    'https://legacy.example/v1', '', 'credential-legacy',
+                    1, 4096, 12, 'UNKNOWN', 'UNKNOWN'
+                )
+                """.trimIndent(),
+            )
+            connection.execSQL(
+                """
+                INSERT INTO provider_model_options (
+                    id, connectionId, remoteModelId, displayName, enabled,
+                    source, discoveredAtEpochMillis, discoveryState
+                ) VALUES (
+                    'model-legacy', 'profile-legacy', 'legacy-model', 'Legacy model',
+                    1, 'MANUAL', NULL, 'CURRENT'
+                )
+                """.trimIndent(),
+            )
+            connection.execSQL(
+                "INSERT INTO conversation_provider_routes (conversationId, providerProfileId, modelId, requestRevision) VALUES ('conversation-legacy', 'profile-legacy', 'model-legacy', 12)",
+            )
+        }
+
+        helper.runMigrationsAndValidate(7, listOf(Migration6To7)).use { connection ->
+            connection.prepare(
+                "SELECT baseUrl, revision FROM provider_profiles WHERE id = 'profile-legacy'",
+            ).use { statement ->
+                assertEquals(true, statement.step())
+                assertEquals("https://legacy.example/v1", statement.getText(0))
+                assertEquals(12L, statement.getLong(1))
+            }
+            connection.prepare(
+                "SELECT providerProfileId, modelId, requestRevision FROM conversation_provider_routes WHERE conversationId = 'conversation-legacy'",
+            ).use { statement ->
+                assertEquals(true, statement.step())
+                assertEquals("profile-legacy", statement.getText(0))
+                assertEquals("model-legacy", statement.getText(1))
+                assertEquals(12L, statement.getLong(2))
+            }
+            connection.prepare("SELECT COUNT(*) FROM generation_attempts").use { statement ->
+                assertEquals(true, statement.step())
+                assertEquals(0L, statement.getLong(0))
+            }
         }
     }
 

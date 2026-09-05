@@ -23,6 +23,9 @@ import dev.cockpit.persistence.api.ArchiveState
 import dev.cockpit.persistence.api.ConversationPersistenceState
 import dev.cockpit.persistence.api.ConversationRepository
 import dev.cockpit.persistence.api.ConversationSnapshot
+import dev.cockpit.persistence.api.GenerationAttemptPersistenceState
+import dev.cockpit.persistence.api.GenerationAttemptRepository
+import dev.cockpit.persistence.api.GenerationAttemptStatus
 import dev.cockpit.persistence.api.MessagePersistenceState
 import dev.cockpit.persistence.api.MessageRole
 import dev.cockpit.persistence.api.MessageSource
@@ -33,7 +36,7 @@ import kotlinx.coroutines.flow.map
 
 class RoomConversationRepository(
     private val database: CockpitDatabase,
-) : ConversationRepository, AgentRepository {
+) : ConversationRepository, AgentRepository, GenerationAttemptRepository {
     override suspend fun save(state: AgentPersistenceState) = database.withWriteTransaction {
         saveAgentRows(state)
     }
@@ -145,6 +148,55 @@ class RoomConversationRepository(
             database.agentImportSourceDao().findAgentId(payloadDigest)?.let(::AgentId)
         }
 
+    override fun observeGenerationAttempt(
+        conversationId: ConversationId,
+    ): Flow<GenerationAttemptPersistenceState?> =
+        database.invalidationTracker.createFlow("generation_attempts").map {
+            loadGenerationAttempt(conversationId)
+        }
+
+    override suspend fun loadGenerationAttempt(
+        conversationId: ConversationId,
+    ): GenerationAttemptPersistenceState? = database.withReadTransaction {
+        database.generationAttemptDao().forConversation(conversationId.value)?.toState()
+    }
+
+    override suspend fun startGenerationAttempt(
+        attempt: GenerationAttemptPersistenceState,
+    ): Boolean = database.withWriteTransaction {
+        val current = database.generationAttemptDao().forConversation(attempt.conversationId.value)
+        if (current?.status == GenerationAttemptStatus.STARTED.name) {
+            false
+        } else {
+            database.generationAttemptDao().upsert(attempt.toEntity())
+            true
+        }
+    }
+
+    override suspend fun finishGenerationAttempt(
+        conversationId: ConversationId,
+        attemptId: String,
+        status: GenerationAttemptStatus,
+        errorCode: String?,
+        updatedAtEpochMillis: Long,
+    ): Boolean {
+        require(status != GenerationAttemptStatus.STARTED) { "A generation attempt needs a terminal status" }
+        return database.withWriteTransaction {
+            database.generationAttemptDao().finishStarted(
+                conversationId = conversationId.value,
+                attemptId = attemptId,
+                status = status.name,
+                errorCode = errorCode,
+                updatedAtEpochMillis = updatedAtEpochMillis,
+            ) == 1
+        }
+    }
+
+    override suspend fun interruptStartedGenerationAttempts(updatedAtEpochMillis: Long): Int =
+        database.withWriteTransaction {
+            database.generationAttemptDao().interruptAllStarted(updatedAtEpochMillis)
+        }
+
     private suspend fun saveAgentRows(state: AgentPersistenceState) {
         val definitionJson = state.agent.persona.definition
             ?.let(AgentDefinitionJsonCodec::encode)
@@ -240,6 +292,32 @@ private fun MessagePersistenceState.toEntity() = MessageEntity(
     role = role.name,
     source = source.name,
     status = status.name,
+)
+
+private fun GenerationAttemptPersistenceState.toEntity() = GenerationAttemptEntity(
+    conversationId = conversationId.value,
+    attemptId = attemptId,
+    providerProfileId = providerProfileId,
+    modelId = modelId,
+    providerRevision = providerRevision,
+    acceptedUserRevision = acceptedUserRevision,
+    status = status.name,
+    errorCode = errorCode,
+    createdAtEpochMillis = createdAtEpochMillis,
+    updatedAtEpochMillis = updatedAtEpochMillis,
+)
+
+private fun GenerationAttemptEntity.toState() = GenerationAttemptPersistenceState(
+    attemptId = attemptId,
+    conversationId = ConversationId(conversationId),
+    providerProfileId = providerProfileId,
+    modelId = modelId,
+    providerRevision = providerRevision,
+    acceptedUserRevision = acceptedUserRevision,
+    status = GenerationAttemptStatus.valueOf(status),
+    errorCode = errorCode,
+    createdAtEpochMillis = createdAtEpochMillis,
+    updatedAtEpochMillis = updatedAtEpochMillis,
 )
 
 private fun Draft.toEntity() = DraftEntity(

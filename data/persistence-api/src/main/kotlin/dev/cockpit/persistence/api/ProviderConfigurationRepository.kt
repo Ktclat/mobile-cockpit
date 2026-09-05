@@ -91,6 +91,11 @@ data class ProviderConfigurationSnapshot(
     val conversationRoutes: List<ConversationProviderRoutePersistenceState>,
 )
 
+data class ProviderProfileMutation(
+    val profile: ProviderProfilePersistenceState,
+    val models: List<ProviderModelOptionPersistenceState> = emptyList(),
+)
+
 interface ProviderConfigurationRepository {
     fun observeConfiguration(): Flow<ProviderConfigurationSnapshot>
     suspend fun loadConfiguration(): ProviderConfigurationSnapshot
@@ -105,6 +110,7 @@ interface ProviderConfigurationRepository {
     suspend fun migrateConversationRoute(
         conversationId: ConversationId,
     ): ConversationProviderRouteResolution
+    suspend fun saveProfileMutation(mutation: ProviderProfileMutation)
     suspend fun saveProfile(profile: ProviderProfilePersistenceState)
     suspend fun saveModels(models: List<ProviderModelOptionPersistenceState>)
     suspend fun saveModel(model: ProviderModelOptionPersistenceState)

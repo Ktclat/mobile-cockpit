@@ -349,8 +349,30 @@ class ArchitectureEvidenceTest {
     }
 
     private fun gitMode(root: Path, path: String): String? {
-        val result = runEvidenceProcess(listOf("git", "ls-files", "--stage", "--", path), root, 10, TimeUnit.SECONDS)
-        if (!result.completed || result.exitCode != 0) return null
+        val gitCommand = if (System.getProperty("os.name").startsWith("Windows")) {
+            listOf(
+                "cmd", "/d", "/c", "git",
+                "-c", "core.excludesFile=",
+                "-c", "safe.directory=${root.toAbsolutePath()}",
+                "ls-files", "--stage", "--", path,
+            )
+        } else {
+            listOf(
+                "git",
+                "-c", "core.excludesFile=",
+                "-c", "safe.directory=${root.toAbsolutePath()}",
+                "ls-files", "--stage", "--", path,
+            )
+        }
+        val result = runEvidenceProcess(
+            gitCommand,
+            root,
+            10,
+            TimeUnit.SECONDS,
+        )
+        if (!result.completed || result.exitCode != 0) {
+            return "git-command-failed(completed=${result.completed}, exit=${result.exitCode}, output=${result.output.take(240)})"
+        }
         return result.output.lineSequence().firstOrNull()?.substringBefore(' ')
     }
 
@@ -718,7 +740,7 @@ class ArchitectureEvidenceTest {
     private companion object {
         const val architectureSource = "docs/superpowers/specs/2026-08-30-system-architecture-v0.1.md"
         const val processCleanupTimeoutSeconds = 5L
-        const val processSetupTimeoutSeconds = 5L
+        const val processSetupTimeoutSeconds = 15L
         const val processCapturePollMillis = 10L
         const val processOutputDeleteRetryMillis = 10L
         val canonicalWorkflow = """
@@ -746,6 +768,8 @@ class ArchitectureEvidenceTest {
                       java-version: '17'
                       cache: gradle
                       check-latest: false
+                  - name: Set up Android SDK
+                    uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699
                   - name: Install Android SDK packages
                     run: sdkmanager "platforms;android-37" "build-tools;36.0.0"
                   - name: Verify foundation

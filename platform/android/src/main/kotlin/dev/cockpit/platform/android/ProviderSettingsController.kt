@@ -11,6 +11,7 @@ import dev.cockpit.application.api.ProviderModelOptionView
 import dev.cockpit.application.api.ProviderModelRouteView
 import dev.cockpit.application.api.ProviderModelSource
 import dev.cockpit.application.api.ProviderOperationResult
+import dev.cockpit.application.api.ProviderOperationCode
 import dev.cockpit.application.api.ProviderProbeState
 import dev.cockpit.application.api.ProviderProfileInput
 import dev.cockpit.application.api.ProviderProfileKindInput
@@ -26,6 +27,7 @@ import dev.cockpit.persistence.api.ProviderConfigurationRepository
 import dev.cockpit.persistence.api.ProviderModelOptionPersistenceState
 import dev.cockpit.persistence.api.ProviderModelRoutePersistenceState
 import dev.cockpit.persistence.api.ProviderProfilePersistenceState
+import dev.cockpit.persistence.api.ProviderProfileMutation
 import dev.cockpit.provider.api.NormalizedProviderRequest
 import dev.cockpit.provider.api.ProviderAuthenticationType as RuntimeAuthenticationType
 import dev.cockpit.provider.api.ProviderCapabilitySupport
@@ -46,6 +48,7 @@ import dev.cockpit.security.vault.api.NewCredential
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -112,23 +115,6 @@ internal class ProviderSettingsController(
                     return@withContext failure("An API key is required for a new configuration.")
                 }
 
-                var createdCredential: CredentialMetadata? = null
-                val credential = when (credentialUpdate) {
-                    ProviderCredentialUpdate.KEEP -> existing?.let {
-                        credentials.metadata(CredentialReference(it.credentialReference))
-                    } ?: return@withContext failure("Enter the API key again to repair this configuration.")
-                    ProviderCredentialUpdate.REPLACE -> credentials.create(
-                        NewCredential("Provider $id", input.apiKey.toCharArray()),
-                    ).also { createdCredential = it }
-                    ProviderCredentialUpdate.DELETE -> existing?.let {
-                        CredentialMetadata(
-                            CredentialReference(it.credentialReference),
-                            "Provider $id",
-                            it.credentialRotation,
-                        )
-                    } ?: return@withContext failure("A new configuration requires an API key.")
-                }
-
                 val requestChanged = existing == null ||
                     existing.kind != kind.name ||
                     existing.baseUrl != endpoint.apiPrefix ||
@@ -145,6 +131,34 @@ internal class ProviderSettingsController(
                     existing.revision == Long.MAX_VALUE -> return@withContext failure("Configuration revision is exhausted.")
                     else -> existing.revision + 1L
                 }
+                val modelUpdates = if (requestChanged && existing != null) {
+                    repository.modelsForProfile(id).map { model ->
+                        if (model.source == ProviderModelSource.MANUAL.name) model else model.copy(
+                            discoveryState = ProviderModelDiscoveryState.STALE.name,
+                        )
+                    }
+                } else {
+                    emptyList()
+                }
+
+                var createdCredential: CredentialMetadata? = null
+                val credential = when (credentialUpdate) {
+                    ProviderCredentialUpdate.KEEP -> existing?.let {
+                        credentials.metadata(CredentialReference(it.credentialReference))
+                            ?.takeIf { metadata -> metadata.rotation == it.credentialRotation }
+                    } ?: return@withContext failure("Enter the API key again to repair this configuration.")
+                    ProviderCredentialUpdate.REPLACE -> credentials.create(
+                        NewCredential("Provider $id", input.apiKey.toCharArray()),
+                    ).also { createdCredential = it }
+                    ProviderCredentialUpdate.DELETE -> existing?.let {
+                        CredentialMetadata(
+                            CredentialReference(it.credentialReference),
+                            "Provider $id",
+                            it.credentialRotation,
+                        )
+                    } ?: return@withContext failure("A new configuration requires an API key.")
+                }
+
                 val now = System.currentTimeMillis()
                 val candidate = ProviderProfilePersistenceState(
                     id = id,
@@ -158,12 +172,12 @@ internal class ProviderSettingsController(
                     maxOutputTokens = input.maxOutputTokens,
                     revision = revision,
                     streamingCapability = if (requestChanged) ProviderCapabilitySupport.UNKNOWN.name
-                        else existing?.streamingCapability ?: ProviderCapabilitySupport.UNKNOWN.name,
+                        else existing.streamingCapability,
                     toolCapability = if (requestChanged) ProviderCapabilitySupport.UNKNOWN.name
-                        else existing?.toolCapability ?: ProviderCapabilitySupport.UNKNOWN.name,
-                    lastProbeErrorCode = if (requestChanged) null else existing?.lastProbeErrorCode,
-                    lastProbeMessage = if (requestChanged) null else existing?.lastProbeMessage,
-                    lastProbedAtEpochMillis = if (requestChanged) null else existing?.lastProbedAtEpochMillis,
+                        else existing.toolCapability,
+                    lastProbeErrorCode = if (requestChanged) null else existing.lastProbeErrorCode,
+                    lastProbeMessage = if (requestChanged) null else existing.lastProbeMessage,
+                    lastProbedAtEpochMillis = if (requestChanged) null else existing.lastProbedAtEpochMillis,
                     note = input.note.trim(),
                     enabled = input.enabled && credentialUpdate != ProviderCredentialUpdate.DELETE,
                     authenticationType = auth.name,
@@ -179,28 +193,43 @@ internal class ProviderSettingsController(
                     },
                     createdAtEpochMillis = existing?.createdAtEpochMillis?.takeIf { it > 0L } ?: now,
                     updatedAtEpochMillis = now,
-                    lastTestModelId = if (requestChanged) null else existing?.lastTestModelId,
-                    lastTestElapsedMillis = if (requestChanged) null else existing?.lastTestElapsedMillis,
+                    lastTestModelId = if (requestChanged) null else existing.lastTestModelId,
+                    lastTestElapsedMillis = if (requestChanged) null else existing.lastTestElapsedMillis,
                 )
                 try {
-                    repository.saveProfile(candidate)
-                    if (requestChanged && existing != null) {
-                        repository.saveModels(
-                            repository.modelsForProfile(id).map { model ->
-                                if (model.source == ProviderModelSource.MANUAL.name) model else model.copy(
-                                    discoveryState = ProviderModelDiscoveryState.STALE.name,
-                                )
-                            },
-                        )
+                    withContext(NonCancellable) {
+                        repository.saveProfileMutation(ProviderProfileMutation(candidate, modelUpdates))
                     }
-                } catch (error: Exception) {
-                    createdCredential?.let { credentials.delete(it.reference) }
+                } catch (error: CancellationException) {
+                    createdCredential?.let { metadata -> deleteCredentialBestEffort(metadata.reference) }
                     throw error
+                } catch (_: Exception) {
+                    val cleanupFailed = createdCredential?.let { metadata ->
+                        !deleteCredentialBestEffort(metadata.reference)
+                    } == true
+                    return@withContext ProviderOperationResult(
+                        success = false,
+                        message = if (cleanupFailed) {
+                            "The configuration transaction failed, and the unused new local credential could not be cleaned up."
+                        } else {
+                            "The configuration transaction failed. The previous configuration remains unchanged."
+                        },
+                        profileId = existing?.id,
+                        code = ProviderOperationCode.PROVIDER_CONFIG_TRANSACTION_FAILED,
+                    )
                 }
-                if (credentialUpdate == ProviderCredentialUpdate.REPLACE && existing != null) {
-                    runCatching { credentials.delete(CredentialReference(existing.credentialReference)) }
-                } else if (credentialUpdate == ProviderCredentialUpdate.DELETE && existing != null) {
-                    credentials.delete(CredentialReference(existing.credentialReference))
+
+                val oldCredential = existing?.takeIf {
+                    credentialUpdate == ProviderCredentialUpdate.REPLACE ||
+                        credentialUpdate == ProviderCredentialUpdate.DELETE
+                }?.let { CredentialReference(it.credentialReference) }
+                if (oldCredential != null && !deleteCredentialBestEffort(oldCredential)) {
+                    return@withContext ProviderOperationResult(
+                        success = true,
+                        message = "Configuration saved, but the previous local credential could not be cleaned up. Retry deletion later; the new configuration will not fall back to the old credential.",
+                        profileId = id,
+                        code = ProviderOperationCode.PROVIDER_CREDENTIAL_CLEANUP_PENDING,
+                    )
                 }
 
                 val suffixMessage = endpoint.removedGenerationSuffix?.let {
@@ -301,9 +330,17 @@ internal class ProviderSettingsController(
                 }.joinToString(", ")
                 return@withContext failure("This configuration is used by $uses. Change those routes before deleting it.")
             }
-            repository.deleteProfile(id)
-            credentials.delete(CredentialReference(profile.credentialReference))
-            ProviderOperationResult(true, "Configuration and encrypted credential deleted.")
+            withContext(NonCancellable) { repository.deleteProfile(id) }
+            if (!deleteCredentialBestEffort(CredentialReference(profile.credentialReference))) {
+                ProviderOperationResult(
+                    success = true,
+                    message = "Configuration deleted, but its unused local credential could not be cleaned up.",
+                    profileId = id,
+                    code = ProviderOperationCode.PROVIDER_CREDENTIAL_CLEANUP_PENDING,
+                )
+            } else {
+                ProviderOperationResult(true, "Configuration and encrypted credential deleted.", id)
+            }
         } catch (error: CancellationException) {
             throw error
         } catch (_: Exception) {
@@ -565,6 +602,16 @@ internal class ProviderSettingsController(
     }
 
     private fun failure(message: String) = ProviderOperationResult(false, message)
+
+    private suspend fun deleteCredentialBestEffort(reference: CredentialReference): Boolean =
+        withContext(NonCancellable) {
+            try {
+                credentials.delete(reference)
+                true
+            } catch (_: Exception) {
+                false
+            }
+        }
 
     private companion object {
         const val INCONCLUSIVE_CODE = "INCONCLUSIVE"

@@ -58,6 +58,35 @@ interface ConversationProviderRouteDao {
 }
 
 @Dao
+interface GenerationAttemptDao {
+    @Upsert suspend fun upsert(entity: GenerationAttemptEntity)
+    @Query("SELECT * FROM generation_attempts WHERE conversationId = :conversationId")
+    suspend fun forConversation(conversationId: String): GenerationAttemptEntity?
+    @Query(
+        """
+        UPDATE generation_attempts
+        SET status = :status, errorCode = :errorCode, updatedAtEpochMillis = :updatedAtEpochMillis
+        WHERE conversationId = :conversationId AND attemptId = :attemptId AND status = 'STARTED'
+        """,
+    )
+    suspend fun finishStarted(
+        conversationId: String,
+        attemptId: String,
+        status: String,
+        errorCode: String?,
+        updatedAtEpochMillis: Long,
+    ): Int
+    @Query(
+        """
+        UPDATE generation_attempts
+        SET status = 'INTERRUPTED', errorCode = 'GENERATION_INTERRUPTED', updatedAtEpochMillis = :updatedAtEpochMillis
+        WHERE status = 'STARTED'
+        """,
+    )
+    suspend fun interruptAllStarted(updatedAtEpochMillis: Long): Int
+}
+
+@Dao
 interface AgentDefinitionRevisionDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insert(entity: AgentDefinitionRevisionEntity)

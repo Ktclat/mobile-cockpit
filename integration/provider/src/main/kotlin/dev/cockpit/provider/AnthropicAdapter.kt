@@ -19,9 +19,13 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 
 class AnthropicAdapter(
-    private val client: OkHttpClient = OkHttpClient(),
+    private val streamingClient: OkHttpClient = OkHttpClient(),
+    private val serviceClient: OkHttpClient = streamingClient,
 ) : ProviderAdapter {
     override val kind = ProviderKind.ANTHROPIC
+    override val promptCapabilities = ProviderPromptCapabilities(
+        PromptPlacementSupport.DEGRADED_TO_USER,
+    )
     private val json = Json { ignoreUnknownKeys = true }
     private val calls = ConcurrentHashMap<ProviderInvocationId, okhttp3.Call>()
 
@@ -62,7 +66,7 @@ class AnthropicAdapter(
             return@withContext ProviderModelDiscoveryResult.Unavailable(authMissing())
         }
         try {
-            client.newCall(builder.build()).execute().use { response ->
+            serviceClient.newCall(builder.build()).execute().use { response ->
                 if (response.isSuccessful) {
                     val payload = response.readBoundedBody(MAX_MODEL_LIST_BODY_BYTES)
                         ?: return@use ProviderModelDiscoveryResult.Unavailable(
@@ -119,7 +123,7 @@ class AnthropicAdapter(
             return@flow
         }
 
-        val call = client.newCall(builder.build())
+        val call = streamingClient.newCall(builder.build())
         calls[request.invocationId] = call
         try {
             call.execute().use { response ->
@@ -261,33 +265,52 @@ class AnthropicAdapter(
             .takeIf(String::isNotBlank)
             ?.let { put("system", it) }
         put("messages", buildJsonArray {
-            request.promptPlan.fewShotMessages.forEach { message ->
+            renderedMessages(request).forEach { message ->
                 add(buildJsonObject {
-                    put("role", if (message.role == PromptMessageRole.USER) "user" else "assistant")
-                    put("content", message.text)
-                })
-            }
-            request.messages.forEach { message ->
-                add(buildJsonObject {
-                    put("role", if (message.role == ProviderMessageRole.ASSISTANT) "assistant" else "user")
-                    put(
-                        "content",
-                        if (message.role == ProviderMessageRole.SYSTEM) {
-                            "<system_message>\n${message.text}\n</system_message>"
-                        } else {
-                            message.text
-                        },
-                    )
-                })
-            }
-            request.promptPlan.postHistoryInstructions.forEach { instruction ->
-                add(buildJsonObject {
-                    put("role", "user")
-                    put("content", "<post_history_instruction>\n$instruction\n</post_history_instruction>")
+                    put("role", message.role)
+                    put("content", message.content)
                 })
             }
         })
     }.toString().toRequestBody(JSON_MEDIA_TYPE)
+
+    private fun renderedMessages(request: NormalizedProviderRequest): List<AnthropicWireMessage> {
+        val messages = buildList {
+            request.promptPlan.fewShotMessages.forEach { message ->
+                add(
+                    AnthropicWireMessage(
+                        role = if (message.role == PromptMessageRole.USER) "user" else "assistant",
+                        content = message.text,
+                    ),
+                )
+            }
+            request.messages.forEach { message ->
+                add(
+                    AnthropicWireMessage(
+                        role = if (message.role == ProviderMessageRole.ASSISTANT) "assistant" else "user",
+                        content = if (message.role == ProviderMessageRole.SYSTEM) {
+                            "<system_message>\n${message.text}\n</system_message>"
+                        } else {
+                            message.text
+                        },
+                    ),
+                )
+            }
+        }.toMutableList()
+        val postHistoryBlock = request.promptPlan.postHistoryInstructions
+            .joinToString("\n\n") { instruction ->
+                "<post_history_instruction>\n$instruction\n</post_history_instruction>"
+            }
+            .takeIf(String::isNotBlank)
+            ?: return messages
+        val last = messages.lastOrNull()
+        if (last?.role == "user") {
+            messages[messages.lastIndex] = last.copy(content = "${last.content}\n\n$postHistoryBlock")
+        } else {
+            messages += AnthropicWireMessage("user", postHistoryBlock)
+        }
+        return messages
+    }
 
     private fun parseObject(data: String): JsonObject? = runCatching {
         json.parseToJsonElement(data) as? JsonObject
@@ -318,4 +341,6 @@ class AnthropicAdapter(
         const val ANTHROPIC_VERSION = "2023-06-01"
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }
+
+    private data class AnthropicWireMessage(val role: String, val content: String)
 }

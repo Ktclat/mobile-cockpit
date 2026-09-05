@@ -3,6 +3,7 @@ package dev.cockpit.mobile
 import android.os.ParcelFileDescriptor
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithContentDescription
@@ -10,7 +11,6 @@ import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
-import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -27,37 +27,40 @@ class ConversationContinuityDeviceTest {
     @Test
     fun switchesTwoConversationsWithoutLeakage() {
         normalizeEvidenceEnvironment()
+        waitForText("Create your first Agent")
         captureEvidence("empty")
-        compose.onNodeWithContentDescription("Create your first Agent").assertIsDisplayed().performClick()
-        compose.onNodeWithContentDescription("Agent name").performTextInput("Ada")
-        compose.onNodeWithContentDescription("Create agent").performClick()
-        waitForDescription("Create new conversation")
-        compose.onNodeWithText("Ada").assertIsDisplayed()
+        compose.onNodeWithText("Create Agent").assertIsDisplayed().performClick()
+        compose.onNodeWithText("Name *").performTextInput("Ada")
+        compose.onNodeWithText("Continue").performClick()
+        waitForText("Definition")
+        compose.onNodeWithText("Continue").performClick()
+        waitForText("Preview")
+        compose.onNodeWithText("Create Agent").performClick()
+        waitForDescription("New Conversation")
+        compose.onAllNodesWithText("Ada").assertCountEquals(2)
         captureEvidence("one-agent")
 
-        compose.onNodeWithContentDescription("Create new conversation").performClick()
+        compose.onNodeWithContentDescription("New Conversation").performClick()
         waitForDescription("Compose message for Ada")
         compose.onNodeWithContentDescription("Compose message for Ada").performTextInput("draft only in A")
         compose.onNodeWithContentDescription("Save draft").performClick()
         waitForText("Draft saved")
-        compose.onNodeWithContentDescription("Open agent detail").performClick()
-        waitForDescription("Create new conversation")
+        compose.onNodeWithContentDescription("Agent detail").performClick()
+        waitForDescription("New Conversation")
 
-        compose.onNodeWithContentDescription("Create new conversation").performClick()
+        compose.onNodeWithContentDescription("New Conversation").performClick()
         waitForDescription("Compose message for Ada")
         compose.onAllNodesWithText("draft only in A").assertCountEquals(0)
         val messageB =
-            "message only in B — long content remains readable and scrollable across the persisted timeline. ".repeat(6)
+            "draft only in B — long content remains readable at large font sizes. ".repeat(6)
         compose.onNodeWithContentDescription("Compose message for Ada").performTextInput(messageB)
-        compose.onNodeWithContentDescription("Send message").performClick()
-        waitForText("Debug reply: $messageB")
-        waitForTextDisplayed(messageB)
-        compose.onNodeWithText("Debug reply: $messageB").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithContentDescription("Configure a model provider").assertIsDisplayed()
-        compose.onNodeWithContentDescription("Send message").assertIsEnabled()
+        compose.onNodeWithText("Model not connected").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Send message").assertIsNotEnabled()
+        compose.onNodeWithContentDescription("Save draft").assertIsEnabled().performClick()
+        waitForText("Draft saved")
         captureEvidence("long-message")
 
-        compose.onNodeWithContentDescription("Open conversation switcher").performClick()
+        compose.onNodeWithContentDescription("Conversations").performClick()
         waitForDescription("Open conversation")
         compose.onNodeWithText("Current", substring = true).assertIsDisplayed()
         captureEvidence("multiple-conversations")
@@ -65,61 +68,52 @@ class ConversationContinuityDeviceTest {
         waitForText("draft only in A")
         compose.onNodeWithText("draft only in A").assertIsDisplayed()
         compose.onAllNodesWithText(messageB).assertCountEquals(0)
-        compose.onNodeWithContentDescription("Send message").performClick()
-        waitForText("Debug reply: draft only in A")
-        waitForTextDisplayed("draft only in A")
-        compose.onNodeWithText("Debug reply: draft only in A").performScrollTo().assertIsDisplayed()
-
-        val recoveryDraft = "unsent draft survives recreation only in A"
-        compose.onNodeWithContentDescription("Compose message for Ada").performTextInput(recoveryDraft)
-        compose.onNodeWithContentDescription("Save draft").performClick()
-        waitForText("Draft saved")
-        compose.onNodeWithContentDescription("Archive conversation").performClick()
-        waitForDescription("Restore conversation")
+        compose.onNodeWithContentDescription("Send message").assertIsNotEnabled()
+        compose.onNodeWithContentDescription("Archive").performClick()
+        waitForText("Restore")
 
         compose.activityRule.scenario.recreate()
-        waitForDescription("Restore conversation")
-        waitForDescription("Open conversation")
-        compose.onNodeWithText("Ada").assertIsDisplayed()
-        compose.onNodeWithContentDescription("Open conversation").performClick()
-        waitForText("Debug reply: $messageB")
-        compose.onNodeWithText(messageB).performScrollTo().assertIsDisplayed()
+        waitForText("Restore")
+        waitForText("Ready to continue")
+        compose.onAllNodesWithText("Ada").assertCountEquals(2)
+        compose.onNodeWithText("Ready to continue").performClick()
+        waitForText(messageB)
+        compose.onNodeWithText(messageB).assertIsDisplayed()
         compose.onAllNodesWithText("draft only in A").assertCountEquals(0)
-        compose.onAllNodesWithText(recoveryDraft).assertCountEquals(0)
 
-        compose.onNodeWithContentDescription("Open agent detail").performClick()
-        waitForDescription("Restore conversation")
-        compose.onNodeWithContentDescription("Restore conversation").performClick()
-        waitForText(recoveryDraft)
-        compose.onNodeWithText(recoveryDraft).assertIsDisplayed()
-        compose.onNodeWithText("draft only in A").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithContentDescription("Agent detail").performClick()
+        waitForText("Restore")
+        compose.onNodeWithText("Restore").performClick()
+        waitForText("draft only in A")
+        compose.onNodeWithText("draft only in A").assertIsDisplayed()
         compose.onAllNodesWithText(messageB).assertCountEquals(0)
+        compose.onNodeWithContentDescription("Send message").assertIsNotEnabled()
 
-        compose.onNodeWithContentDescription("Open conversation switcher").performClick()
+        compose.onNodeWithContentDescription("Conversations").performClick()
         waitForDescription("Open conversation")
         compose.onNodeWithContentDescription("Open conversation").performClick()
-        waitForText("Debug reply: $messageB")
-        compose.onNodeWithText(messageB).performScrollTo().assertIsDisplayed()
+        waitForText(messageB)
+        compose.onNodeWithText(messageB).assertIsDisplayed()
         compose.onAllNodesWithText("draft only in A").assertCountEquals(0)
-        compose.onAllNodesWithText(recoveryDraft).assertCountEquals(0)
 
         try {
-            runShell("cmd uimode night yes")
+            setUiPreferences(theme = "DARK")
             compose.activityRule.scenario.recreate()
             waitForDescription("Cockpit dark theme")
             waitForText(messageB)
             captureEvidence("dark-theme")
 
-            runShell("cmd uimode night no")
             runShell("settings put system font_scale 2.0")
+            waitForFontScale(2f)
+            setUiPreferences(theme = "LIGHT")
             compose.activityRule.scenario.recreate()
             waitForDescription("Cockpit light theme")
             waitForFontScale(2f)
             waitForText(messageB)
             captureEvidence("font-scale-200")
         } finally {
-            runShell("cmd uimode night no")
             runShell("settings put system font_scale 1.0")
+            runCatching { setUiPreferences(theme = "SYSTEM", language = "SYSTEM") }
         }
     }
 
@@ -135,12 +129,6 @@ class ConversationContinuityDeviceTest {
         }
     }
 
-    private fun waitForTextDisplayed(text: String) {
-        compose.waitUntil(timeoutMillis = 10_000) {
-            runCatching { compose.onNodeWithText(text).assertIsDisplayed() }.isSuccess
-        }
-    }
-
     private fun waitForFontScale(expected: Float) {
         compose.waitUntil(timeoutMillis = 10_000) {
             var actual = 0f
@@ -152,10 +140,23 @@ class ConversationContinuityDeviceTest {
     }
 
     private fun normalizeEvidenceEnvironment() {
-        runShell("cmd uimode night no")
         runShell("settings put system font_scale 1.0")
+        waitForFontScale(1f)
+        setUiPreferences(theme = "LIGHT")
         compose.activityRule.scenario.recreate()
         waitForDescription("Cockpit light theme")
+    }
+
+    private fun setUiPreferences(theme: String, language: String = "ENGLISH") {
+        compose.activityRule.scenario.onActivity { activity ->
+            check(
+                activity.getSharedPreferences("cockpit_ui_preferences", android.content.Context.MODE_PRIVATE)
+                    .edit()
+                    .putString("theme", theme)
+                    .putString("language", language)
+                    .commit(),
+            ) { "UI test preferences could not be committed" }
+        }
     }
 
     private fun captureEvidence(name: String) {

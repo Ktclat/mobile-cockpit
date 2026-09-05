@@ -12,6 +12,7 @@ import dev.cockpit.persistence.api.ProviderConfigurationSnapshot
 import dev.cockpit.persistence.api.ProviderModelOptionPersistenceState
 import dev.cockpit.persistence.api.ProviderModelRoutePersistenceState
 import dev.cockpit.persistence.api.ProviderProfilePersistenceState
+import dev.cockpit.persistence.api.ProviderProfileMutation
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 
@@ -101,8 +102,16 @@ class RoomProviderConfigurationRepository(
         ConversationProviderRouteResolution.Ready(resolved, migrated.toState())
     }
 
+    override suspend fun saveProfileMutation(mutation: ProviderProfileMutation) =
+        database.withWriteTransaction {
+            database.providerProfileDao().upsert(mutation.profile.toEntity())
+            if (mutation.models.isNotEmpty()) {
+                database.providerModelOptionDao().upsertAll(mutation.models.map { it.toEntity() })
+            }
+        }
+
     override suspend fun saveProfile(profile: ProviderProfilePersistenceState) =
-        database.withWriteTransaction { database.providerProfileDao().upsert(profile.toEntity()) }
+        saveProfileMutation(ProviderProfileMutation(profile))
 
     override suspend fun saveModels(models: List<ProviderModelOptionPersistenceState>) {
         if (models.isEmpty()) return

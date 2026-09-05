@@ -3,6 +3,7 @@ package dev.cockpit.provider.api
 enum class ProviderErrorCode {
     MODEL_ROUTE_MISSING,
     MODEL_ROUTE_REVISION_MISMATCH,
+    GENERATION_INTERRUPTED,
     AUTH,
     PERMISSION,
     RATE_LIMIT,

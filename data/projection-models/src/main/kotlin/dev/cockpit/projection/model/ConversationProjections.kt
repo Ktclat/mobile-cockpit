@@ -34,6 +34,7 @@ data class AgentDetailProjection(
 )
 data class ConversationSummaryProjection(val id: ConversationId, val revision: ConversationRevision, val archiveState: ArchiveProjectionState)
 enum class ConversationProviderRouteState { READY, MISSING, REVISION_MISMATCH }
+enum class GenerationAttemptProjectionStatus { STARTED, COMPLETED, FAILED, CANCELLED, INTERRUPTED }
 data class ConversationProjection(
     val id: ConversationId,
     val agentId: AgentId,
@@ -46,6 +47,7 @@ data class ConversationProjection(
     val providerRouteState: ConversationProviderRouteState = ConversationProviderRouteState.MISSING,
     val streamingReply: StreamingReplyProjection? = null,
     val providerError: ProviderReplyErrorProjection? = null,
+    val generationAttempt: GenerationAttemptProjection? = null,
 )
 data class BoundProviderProjection(
     val id: String,
@@ -54,6 +56,9 @@ data class BoundProviderProjection(
     val available: Boolean,
     val usesDefault: Boolean = false,
     val modelId: String? = null,
+    val vendor: String = "",
+    val protocol: String = "",
+    val endpointOrigin: String = "",
 )
 data class StreamingReplyProjection(
     val invocationId: String,
@@ -65,6 +70,11 @@ data class ProviderReplyErrorProjection(
     val code: String,
     val message: String,
     val retryable: Boolean,
+)
+data class GenerationAttemptProjection(
+    val attemptId: String,
+    val status: GenerationAttemptProjectionStatus,
+    val errorCode: String?,
 )
 data class DraftProjection(val destination: ConversationMessageDestination, val text: String)
 data class MessageProjection(val id: String, val text: String, val ordinal: Long, val role: MessageRoleProjection, val source: MessageSourceProjection, val status: MessageStatusProjection)
