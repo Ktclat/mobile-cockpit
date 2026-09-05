@@ -1,5 +1,7 @@
 package dev.cockpit.runtime.coordinator
 
+import dev.cockpit.domain.ids.IdGenerator
+import dev.cockpit.domain.time.AppClock
 import dev.cockpit.provider.api.NormalizedProviderRequest
 import dev.cockpit.provider.api.ProviderAdapterResolver
 import dev.cockpit.provider.api.ProviderCredentialPurpose
@@ -13,7 +15,6 @@ import dev.cockpit.provider.api.ProviderProbeResult
 import dev.cockpit.provider.api.ProviderProfile
 import dev.cockpit.provider.api.ProviderStreamEvent
 import dev.cockpit.security.vault.api.ProviderCredentialLeasePort
-import java.util.UUID
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flow
@@ -21,11 +22,12 @@ import kotlinx.coroutines.flow.flow
 class ProviderInvocationGate(
     private val credentialLeases: ProviderCredentialLeasePort,
     private val adapters: ProviderAdapterResolver,
-    private val clockMillis: () -> Long = System::currentTimeMillis,
-    private val ownerEpoch: String = UUID.randomUUID().toString(),
+    private val clock: AppClock,
+    private val ids: IdGenerator,
+    private val ownerEpoch: String = ids.nextId(),
 ) {
     suspend fun probe(profile: ProviderProfile): ProviderProbeResult {
-        val invocationId = ProviderInvocationId(UUID.randomUUID().toString())
+        val invocationId = ProviderInvocationId(ids.nextId())
         val handle = credentialLeases.acquire(
             authority(profile, invocationId, ProviderCredentialPurpose.CAPABILITY_PROBE),
         ) ?: return ProviderProbeResult.Unavailable(credentialUnavailable())
@@ -35,7 +37,7 @@ class ProviderInvocationGate(
     }
 
     suspend fun discoverModels(profile: ProviderProfile): ProviderModelDiscoveryResult {
-        val invocationId = ProviderInvocationId(UUID.randomUUID().toString())
+        val invocationId = ProviderInvocationId(ids.nextId())
         val handle = credentialLeases.acquire(
             authority(profile, invocationId, ProviderCredentialPurpose.MODEL_DISCOVERY),
         ) ?: return ProviderModelDiscoveryResult.Unavailable(credentialUnavailable())
@@ -72,7 +74,7 @@ class ProviderInvocationGate(
         invocationId: ProviderInvocationId,
         purpose: ProviderCredentialPurpose,
     ): ProviderInvocationAuthority {
-        val now = clockMillis()
+        val now = clock.now().epochMilliseconds
         val expiresAt = if (now > Long.MAX_VALUE - AUTHORITY_LIFETIME_MILLIS) {
             Long.MAX_VALUE
         } else {

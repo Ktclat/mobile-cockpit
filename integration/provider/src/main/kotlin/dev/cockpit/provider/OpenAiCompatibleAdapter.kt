@@ -1,6 +1,7 @@
 package dev.cockpit.provider
 
 import dev.cockpit.domain.bytes.ImmutableBytes
+import dev.cockpit.domain.prompt.PromptMessageRole
 import dev.cockpit.provider.api.*
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
@@ -177,26 +178,14 @@ class OpenAiCompatibleAdapter(
         put("model", request.profile.model)
         put("stream", true)
         put("max_output_tokens", request.maxOutputTokens)
-        if (request.systemInstruction.isNotBlank()) put("instructions", request.systemInstruction)
+        request.promptPlan.systemInstructions.joinToString("\n\n")
+            .takeIf(String::isNotBlank)
+            ?.let { put("instructions", it) }
         put("input", buildJsonArray {
-            request.messages.filter { it.role != ProviderMessageRole.SYSTEM }.forEach { message ->
+            request.promptPlan.fewShotMessages.forEach { message ->
                 add(buildJsonObject {
-                    put("role", if (message.role == ProviderMessageRole.USER) "user" else "assistant")
+                    put("role", if (message.role == PromptMessageRole.USER) "user" else "assistant")
                     put("content", message.text)
-                })
-            }
-        })
-    }
-
-    private fun chatBody(request: NormalizedProviderRequest) = buildJsonObject {
-        put("model", request.profile.model)
-        put("stream", true)
-        put("max_tokens", request.maxOutputTokens)
-        put("messages", buildJsonArray {
-            if (request.systemInstruction.isNotBlank()) {
-                add(buildJsonObject {
-                    put("role", "system")
-                    put("content", request.systemInstruction)
                 })
             }
             request.messages.forEach { message ->
@@ -207,6 +196,48 @@ class OpenAiCompatibleAdapter(
                         ProviderMessageRole.ASSISTANT -> "assistant"
                     })
                     put("content", message.text)
+                })
+            }
+            request.promptPlan.postHistoryInstructions.forEach { instruction ->
+                add(buildJsonObject {
+                    put("role", "system")
+                    put("content", instruction)
+                })
+            }
+        })
+    }
+
+    private fun chatBody(request: NormalizedProviderRequest) = buildJsonObject {
+        put("model", request.profile.model)
+        put("stream", true)
+        put("max_tokens", request.maxOutputTokens)
+        put("messages", buildJsonArray {
+            request.promptPlan.systemInstructions.forEach { instruction ->
+                add(buildJsonObject {
+                    put("role", "system")
+                    put("content", instruction)
+                })
+            }
+            request.promptPlan.fewShotMessages.forEach { message ->
+                add(buildJsonObject {
+                    put("role", if (message.role == PromptMessageRole.USER) "user" else "assistant")
+                    put("content", message.text)
+                })
+            }
+            request.messages.forEach { message ->
+                add(buildJsonObject {
+                    put("role", when (message.role) {
+                        ProviderMessageRole.SYSTEM -> "system"
+                        ProviderMessageRole.USER -> "user"
+                        ProviderMessageRole.ASSISTANT -> "assistant"
+                    })
+                    put("content", message.text)
+                })
+            }
+            request.promptPlan.postHistoryInstructions.forEach { instruction ->
+                add(buildJsonObject {
+                    put("role", "system")
+                    put("content", instruction)
                 })
             }
         })

@@ -6,15 +6,13 @@ import dev.cockpit.domain.agent.LorebookEntry
 import dev.cockpit.domain.agent.LorebookPosition
 import dev.cockpit.domain.agent.Persona
 import dev.cockpit.domain.agent.editableDefinition
+import dev.cockpit.domain.prompt.ConservativeTokenEstimator
+import dev.cockpit.domain.prompt.PromptMessage
+import dev.cockpit.domain.prompt.PromptMessageRole
+import dev.cockpit.domain.prompt.PromptPlan
+import dev.cockpit.domain.prompt.TokenEstimator
 
-data class AgentPromptPlan(
-    val systemInstruction: String,
-    val estimatedInputTokens: Int,
-    val activeLorebookEntryIds: List<String>,
-    val notices: List<String>,
-)
-
-object AgentPromptBuilder {
+object AgentPromptPlanner {
     const val DEFAULT_USER_NAME = "User"
 
     fun defaultSystemPrompt(mode: AgentMode): String = when (mode) {
@@ -30,14 +28,15 @@ object AgentPromptBuilder {
         persona: Persona,
         userName: String = DEFAULT_USER_NAME,
         conversationText: List<String> = emptyList(),
-    ): AgentPromptPlan {
+        tokenEstimator: TokenEstimator = ConservativeTokenEstimator,
+    ): PromptPlan {
         if (persona.definition == null) {
             val legacy = "You are ${persona.identity}. Presentation: ${persona.presentation}. " +
                 "Voice: ${persona.voice}. Behavior: ${persona.behavioralTendency}. " +
                 "Reply style: ${persona.promptStyle}."
-            return AgentPromptPlan(
-                systemInstruction = legacy,
-                estimatedInputTokens = estimateTokens(legacy),
+            return PromptPlan(
+                systemInstructions = listOf(legacy),
+                estimatedInputTokens = tokenEstimator.estimate(legacy),
                 activeLorebookEntryIds = emptyList(),
                 notices = listOf("Legacy Agent settings are preserved."),
             )
@@ -50,7 +49,7 @@ object AgentPromptBuilder {
             .replace(ORIGINAL_MACRO, defaultPrompt)
         val postHistory = definition.postHistoryInstructions
             .replace(ORIGINAL_MACRO, "")
-        val lorebook = matchLorebook(definition, conversationText)
+        val lorebook = matchLorebook(definition, conversationText, tokenEstimator)
 
         val sections = buildList {
             add(renderMacros(selectedPrompt, characterName, userName))
@@ -65,23 +64,29 @@ object AgentPromptBuilder {
                 add(section("Current scenario", renderMacros(definition.scenario, characterName, userName)))
             }
             lorebook.after.forEach { add(section("Relevant context", renderMacros(it.content, characterName, userName))) }
-            if (definition.exampleDialogue.isNotBlank()) {
-                add(section("Dialogue examples", renderMacros(definition.exampleDialogue, characterName, userName)))
-            }
-            if (postHistory.isNotBlank()) {
-                add(section("After-history instruction", renderMacros(postHistory, characterName, userName)))
-            }
         }
         val assembled = sections.filter(String::isNotBlank).joinToString("\n\n")
+        val fewShot = parseExampleDialogue(
+            renderMacros(definition.exampleDialogue, characterName, userName),
+            characterName,
+            userName,
+        )
+        val renderedPostHistory = renderMacros(postHistory, characterName, userName).trim()
+        val estimated = estimateTokens(
+            texts = listOf(assembled) + fewShot.map(PromptMessage::text) + renderedPostHistory,
+            tokenEstimator = tokenEstimator,
+        )
         val notices = buildList {
             addAll(lorebook.notices)
-            if (estimateTokens(assembled) > MAX_ESTIMATED_FIXED_TOKENS) {
+            if (estimated > MAX_ESTIMATED_FIXED_TOKENS) {
                 add("The fixed Agent definition is very large and may exceed some model contexts.")
             }
         }
-        return AgentPromptPlan(
-            systemInstruction = assembled,
-            estimatedInputTokens = estimateTokens(assembled),
+        return PromptPlan(
+            systemInstructions = listOfNotNull(assembled.takeIf(String::isNotBlank)),
+            fewShotMessages = fewShot,
+            postHistoryInstructions = listOfNotNull(renderedPostHistory.takeIf(String::isNotBlank)),
+            estimatedInputTokens = estimated,
             activeLorebookEntryIds = (lorebook.before + lorebook.after).map(LorebookEntry::id),
             notices = notices,
         )
@@ -97,9 +102,6 @@ object AgentPromptBuilder {
         userName = userName,
     )
 
-    fun estimateTokens(text: String): Int =
-        if (text.isBlank()) 0 else (text.length + 3) / 4
-
     private fun renderMacros(text: String, characterName: String, userName: String): String =
         text.replace(CHAR_MACRO, characterName)
             .replace(USER_MACRO, userName)
@@ -111,6 +113,7 @@ object AgentPromptBuilder {
     private fun matchLorebook(
         definition: AgentDefinition,
         conversationText: List<String>,
+        tokenEstimator: TokenEstimator,
     ): LorebookMatch {
         val scanDepth = definition.lorebookScanDepth.coerceIn(1, 100)
         val haystack = conversationText.takeLast(scanDepth).joinToString("\n")
@@ -127,8 +130,8 @@ object AgentPromptBuilder {
         val selected = mutableListOf<IndexedValue<LorebookEntry>>()
         var skippedForBudget = 0
         candidates.forEach { candidate ->
-            val cost = estimateTokens(candidate.value.content)
-            if (used + cost <= budget) {
+            val cost = tokenEstimator.estimate(candidate.value.content).coerceAtLeast(0)
+            if (cost <= budget - used) {
                 selected += candidate
                 used += cost
             } else {
@@ -166,10 +169,69 @@ object AgentPromptBuilder {
         val notices: List<String>,
     )
 
+    private fun estimateTokens(
+        texts: List<String>,
+        tokenEstimator: TokenEstimator,
+    ): Int {
+        var total = 0L
+        texts.forEach { text ->
+            total = (total + tokenEstimator.estimate(text).coerceAtLeast(0).toLong())
+                .coerceAtMost(Int.MAX_VALUE.toLong())
+        }
+        return total.toInt()
+    }
+
+    private fun parseExampleDialogue(
+        rendered: String,
+        characterName: String,
+        userName: String,
+    ): List<PromptMessage> {
+        if (rendered.isBlank()) return emptyList()
+        val messages = mutableListOf<PromptMessage>()
+        var currentRole: PromptMessageRole? = null
+        val currentText = StringBuilder()
+
+        fun flush() {
+            val text = currentText.toString().trim()
+            val role = currentRole
+            if (role != null && text.isNotEmpty()) messages += PromptMessage(role, text)
+            currentText.clear()
+        }
+
+        rendered.lineSequence().forEach { rawLine ->
+            val line = rawLine.trimEnd()
+            if (line.trim().equals("<START>", ignoreCase = true)) {
+                flush()
+                currentRole = null
+                return@forEach
+            }
+            val match = SPEAKER_LINE.matchEntire(line.trimStart())
+            val role = match?.groupValues?.get(1)?.trim()?.let { speaker ->
+                when {
+                    speaker.equals(userName, ignoreCase = true) -> PromptMessageRole.USER
+                    speaker.equals(characterName, ignoreCase = true) -> PromptMessageRole.ASSISTANT
+                    else -> null
+                }
+            }
+            if (role != null) {
+                flush()
+                currentRole = role
+                currentText.append(match.groupValues[2])
+            } else if (line.isNotBlank()) {
+                if (currentRole == null) currentRole = PromptMessageRole.USER
+                if (currentText.isNotEmpty()) currentText.append('\n')
+                currentText.append(line)
+            }
+        }
+        flush()
+        return messages
+    }
+
     private val ORIGINAL_MACRO = Regex(Regex.escape("{{original}}"), RegexOption.IGNORE_CASE)
     private val CHAR_MACRO = Regex(Regex.escape("{{char}}"), RegexOption.IGNORE_CASE)
     private val USER_MACRO = Regex(Regex.escape("{{user}}"), RegexOption.IGNORE_CASE)
     private val BOT_ALIAS = Regex("<BOT>", RegexOption.IGNORE_CASE)
     private val USER_ALIAS = Regex("<USER>", RegexOption.IGNORE_CASE)
+    private val SPEAKER_LINE = Regex("^([^:\\n]{1,120}):\\s*(.*)$")
     private const val MAX_ESTIMATED_FIXED_TOKENS = 24_000
 }

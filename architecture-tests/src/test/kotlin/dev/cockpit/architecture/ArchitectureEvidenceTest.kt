@@ -15,7 +15,12 @@ import org.junit.jupiter.api.Test
 class ArchitectureEvidenceTest {
     @Test
     fun rejectsCommentedWorkflowTriggers() {
-        assertWorkflowRejected(canonicalWorkflow.replace("on:\n  push:\n  pull_request:", "# on:\n#   push:\n#   pull_request:"))
+        assertWorkflowRejected(
+            canonicalWorkflow.replace(
+                "on:\n  workflow_dispatch:\n  pull_request:\n  push:\n    branches:\n      - main",
+                "# on:\n#   workflow_dispatch:\n#   pull_request:\n#   push:\n#     branches:\n#       - main",
+            ),
+        )
     }
 
     @Test
@@ -717,11 +722,14 @@ class ArchitectureEvidenceTest {
         const val processCapturePollMillis = 10L
         const val processOutputDeleteRetryMillis = 10L
         val canonicalWorkflow = """
-            name: Android foundation
+            name: Android verification
 
             on:
-              push:
+              workflow_dispatch:
               pull_request:
+              push:
+                branches:
+                  - main
 
             permissions:
               contents: read
@@ -739,7 +747,7 @@ class ArchitectureEvidenceTest {
                       cache: gradle
                       check-latest: false
                   - name: Install Android SDK packages
-                    run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+                    run: sdkmanager "platforms;android-37" "build-tools;36.0.0"
                   - name: Verify foundation
                     run: ./gradlew test verifyArchitecture :app:assembleDebug lint
         """.trimIndent() + "\n"

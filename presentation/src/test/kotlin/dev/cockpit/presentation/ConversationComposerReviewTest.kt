@@ -23,6 +23,7 @@ import dev.cockpit.projection.model.ConversationSummaryProjection
 import dev.cockpit.projection.model.AgentSummaryProjection
 import dev.cockpit.projection.model.AgentDetailProjection
 import dev.cockpit.projection.model.ConversationProjection
+import dev.cockpit.projection.model.ConversationProviderRouteState
 import dev.cockpit.projection.model.DraftProjection
 import kotlinx.coroutines.CompletableDeferred
 import org.junit.Assert.assertEquals
@@ -78,7 +79,7 @@ class ConversationComposerReviewTest {
 
         composeRule.onNodeWithContentDescription("Send message").performClick()
         composeRule.waitForIdle()
-        composeRule.onNodeWithContentDescription("Send message").assertIsEnabled()
+        composeRule.onNodeWithContentDescription("Compose message for Ada").assertIsEnabled()
         composeRule.onNodeWithContentDescription("Compose message for Ada").performTextInput("second")
         composeRule.onNodeWithContentDescription("Send message").performClick()
         composeRule.waitForIdle()
@@ -105,12 +106,48 @@ class ConversationComposerReviewTest {
         completion.complete(true)
         composeRule.waitForIdle()
 
-        composeRule.onNodeWithContentDescription("Send message").assertIsEnabled()
+        composeRule.onNodeWithContentDescription("Compose message for Ada").assertIsEnabled()
         composeRule.onNodeWithContentDescription("Compose message for Ada").performTextInput("second")
         composeRule.onNodeWithContentDescription("Send message").performClick()
         composeRule.waitForIdle()
 
         assertEquals(listOf(initial to "first", advanced to "second"), sent)
+    }
+
+    @Test fun unavailableOrChangedRouteDisablesSendButKeepsDraftSaveAvailable() {
+        val conversation = ConversationId("route-guard")
+        val destination = ConversationMessageDestination(conversation, ConversationRevision(3))
+        var projection by mutableStateOf(
+            projection(destination, listOf(DraftProjection(destination, "keep draft"))).copy(
+                providerRouteState = ConversationProviderRouteState.MISSING,
+            ),
+        )
+        var saves = 0
+        var sends = 0
+        composeRule.setContent {
+            ConversationComposer(
+                projection,
+                "Ada",
+                onSaveDraft = { _, _ -> saves += 1; true },
+                onSendMessage = { _, _ -> sends += 1; true },
+                onBack = { false },
+            )
+        }
+
+        composeRule.onNodeWithContentDescription("Save draft").assertIsEnabled()
+        composeRule.onNodeWithContentDescription("Send message").assertIsNotEnabled()
+        composeRule.runOnIdle {
+            projection = projection.copy(
+                providerRouteState = ConversationProviderRouteState.REVISION_MISMATCH,
+            )
+        }
+        composeRule.onNodeWithContentDescription("Save draft").assertIsEnabled()
+        composeRule.onNodeWithContentDescription("Send message").assertIsNotEnabled()
+        composeRule.onNodeWithContentDescription("Save draft").performClick()
+        composeRule.waitForIdle()
+
+        assertEquals(1, saves)
+        assertEquals(0, sends)
     }
 
     @Test fun successfulSendFollowsMultipleAdvancesOnlyUntilNewEditFreezesDestination() {
@@ -139,7 +176,7 @@ class ConversationComposerReviewTest {
         composeRule.waitForIdle()
         composeRule.runOnIdle { projection = projection(afterAgent, emptyList()) }
         composeRule.waitForIdle()
-        composeRule.onNodeWithContentDescription("Send message").assertIsEnabled()
+        composeRule.onNodeWithContentDescription("Compose message for Ada").assertIsEnabled()
 
         composeRule.onNodeWithContentDescription("Compose message for Ada").performTextInput("unsent")
         composeRule.runOnIdle { projection = projection(externalAdvance, emptyList()) }
@@ -430,5 +467,6 @@ class ConversationComposerReviewTest {
         archiveState = ArchiveProjectionState.ACTIVE,
         drafts = drafts,
         timeline = emptyList(),
+        providerRouteState = ConversationProviderRouteState.READY,
     )
 }

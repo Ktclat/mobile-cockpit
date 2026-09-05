@@ -69,6 +69,20 @@ data class ConversationProviderRoutePersistenceState(
     val requestRevision: Long,
 )
 
+sealed interface ConversationProviderRouteResolution {
+    data class Ready(
+        val profile: ProviderProfilePersistenceState,
+        val route: ConversationProviderRoutePersistenceState,
+    ) : ConversationProviderRouteResolution
+
+    data class RevisionMismatch(
+        val route: ConversationProviderRoutePersistenceState,
+        val currentProfileRevision: Long,
+    ) : ConversationProviderRouteResolution
+
+    data object Missing : ConversationProviderRouteResolution
+}
+
 data class ProviderConfigurationSnapshot(
     val profiles: List<ProviderProfilePersistenceState>,
     val models: List<ProviderModelOptionPersistenceState>,
@@ -84,10 +98,13 @@ interface ProviderConfigurationRepository {
     suspend fun loadModel(id: String): ProviderModelOptionPersistenceState?
     suspend fun modelsForProfile(id: String): List<ProviderModelOptionPersistenceState>
     suspend fun profileForAgent(agentId: AgentId): ProviderProfilePersistenceState?
-    suspend fun profileForConversation(
+    suspend fun resolveConversationRoute(
         conversationId: ConversationId,
         agentId: AgentId,
-    ): ProviderProfilePersistenceState?
+    ): ConversationProviderRouteResolution
+    suspend fun migrateConversationRoute(
+        conversationId: ConversationId,
+    ): ConversationProviderRouteResolution
     suspend fun saveProfile(profile: ProviderProfilePersistenceState)
     suspend fun saveModels(models: List<ProviderModelOptionPersistenceState>)
     suspend fun saveModel(model: ProviderModelOptionPersistenceState)

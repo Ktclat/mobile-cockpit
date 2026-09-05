@@ -137,6 +137,7 @@ internal class ProviderSettingsController(
                     existing.organizationId != input.organizationId.trim() ||
                     existing.projectId != input.projectId.trim() ||
                     existing.workspaceId != input.workspaceId.trim() ||
+                    existing.maxOutputTokens != input.maxOutputTokens ||
                     credentialUpdate != ProviderCredentialUpdate.KEEP
                 val revision = when {
                     existing == null -> 0L
@@ -492,7 +493,7 @@ internal class ProviderSettingsController(
                     NormalizedProviderRequest(
                         invocationId = invocationId,
                         profile = profile,
-                        systemInstruction = "",
+                        promptPlan = dev.cockpit.domain.prompt.PromptPlan(),
                         messages = listOf(
                             ProviderMessage(ProviderMessageRole.USER, "Please reply with only OK."),
                         ),

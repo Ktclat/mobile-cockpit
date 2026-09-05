@@ -83,6 +83,7 @@ import dev.cockpit.application.api.ProviderSettingsSnapshot
 import dev.cockpit.domain.AgentId
 import dev.cockpit.domain.agent.AgentMode
 import dev.cockpit.domain.agent.LorebookEntry
+import dev.cockpit.domain.prompt.ConservativeTokenEstimator
 import dev.cockpit.projection.model.ArchiveProjectionState
 import dev.cockpit.projection.model.BoundProviderProjection
 import dev.cockpit.projection.model.ConversationSummaryProjection
@@ -752,8 +753,8 @@ private fun FullScreenTextEditor(
                 DetailHeader(
                     title = field.label(translator),
                     subtitle = translator.choose(
-                        "${draft.length} chars · about ${(draft.length + 3) / 4} tokens",
-                        "${draft.length} 字符 · 约 ${(draft.length + 3) / 4} tokens",
+                        "${draft.length} chars · about ${ConservativeTokenEstimator.estimate(draft)} tokens",
+                        "${draft.length} 字符 · 约 ${ConservativeTokenEstimator.estimate(draft)} tokens",
                     ),
                     onBack = onDismiss,
                 ) {
@@ -1707,7 +1708,7 @@ private fun AgentProfileInput.estimatedDefinitionTokens(): Int {
         postHistoryInstructions,
         lorebookEntries.joinToString("\n") { it.content },
     ).joinToString("\n")
-    return if (text.isBlank()) 0 else (text.length + 3) / 4
+    return ConservativeTokenEstimator.estimate(text)
 }
 
 private fun renderPreviewMacros(text: String, profile: AgentProfileInput): String = text

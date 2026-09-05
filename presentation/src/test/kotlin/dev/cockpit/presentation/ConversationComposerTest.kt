@@ -20,6 +20,7 @@ import dev.cockpit.projection.model.AgentDetailProjection
 import dev.cockpit.projection.model.AgentSummaryProjection
 import dev.cockpit.projection.model.ArchiveProjectionState
 import dev.cockpit.projection.model.ConversationProjection
+import dev.cockpit.projection.model.ConversationProviderRouteState
 import dev.cockpit.projection.model.ConversationSummaryProjection
 import dev.cockpit.projection.model.DraftProjection
 import dev.cockpit.projection.model.HomeProjection
@@ -143,5 +144,6 @@ class ConversationComposerTest {
         archiveState = ArchiveProjectionState.ACTIVE,
         drafts = emptyList(),
         timeline = emptyList(),
+        providerRouteState = ConversationProviderRouteState.READY,
     )
 }

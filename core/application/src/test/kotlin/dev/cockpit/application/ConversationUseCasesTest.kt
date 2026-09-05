@@ -42,13 +42,13 @@ class ConversationUseCasesTest {
 
         assertEquals(AgentId("agent-deterministic"), agent.id)
         assertEquals(ArchiveState.ACTIVE, repository.state?.archiveState)
-        assertEquals(0L, repository.state?.revision)
+        assertEquals(1L, repository.state?.revision)
     }
 
     @Test
     fun sendRejectsStaleDestinationWithoutWriting() = runBlocking {
         val repository = RecordingConversationRepository(snapshot())
-        val send = SendConversationMessage(repository, object : IdGenerator {
+        val send = sendUseCase(repository, object : IdGenerator {
             override fun nextId() = "message-1"
         })
 
@@ -122,7 +122,7 @@ class ConversationUseCasesTest {
     fun sendExactDestinationPersistsOneUserMessageAndAdvancesRevisionOnce() = runBlocking {
         val original = snapshot().copy(messages = listOf(MessagePersistenceState("existing", Message(ConversationId("conversation-1"), "before"), 8, MessageRole.AGENT, MessageSource.RUNTIME, MessageStatus.DELIVERED)))
         val repository = RecordingConversationRepository(original)
-        val result = SendConversationMessage(repository, object : IdGenerator { override fun nextId() = "message-1" })(
+        val result = sendUseCase(repository, object : IdGenerator { override fun nextId() = "message-1" })(
             ConversationMessageDestination(ConversationId("conversation-1"), ConversationRevision(4)),
             "Send exact",
         )
@@ -153,7 +153,7 @@ class ConversationUseCasesTest {
         ))
         val repository = RecordingConversationRepository(exhausted)
 
-        val result = SendConversationMessage(repository, object : IdGenerator { override fun nextId() = "must-not-be-used" })(
+        val result = sendUseCase(repository, object : IdGenerator { override fun nextId() = "must-not-be-used" })(
             ConversationMessageDestination(ConversationId("conversation-1"), ConversationRevision(Long.MAX_VALUE)),
             "Do not wrap",
         )
@@ -167,7 +167,7 @@ class ConversationUseCasesTest {
         val repository = RecordingConversationRepository(snapshot().copy(messages = listOf(MessagePersistenceState("max", Message(ConversationId("conversation-1"), "max"), Long.MAX_VALUE, MessageRole.USER, MessageSource.USER, MessageStatus.ACCEPTED))))
         var ids = 0
 
-        val result = SendConversationMessage(repository, object : IdGenerator { override fun nextId() = "id-${++ids}" })(ConversationMessageDestination(ConversationId("conversation-1"), ConversationRevision(4)), "no wrap")
+        val result = sendUseCase(repository, object : IdGenerator { override fun nextId() = "id-${++ids}" })(ConversationMessageDestination(ConversationId("conversation-1"), ConversationRevision(4)), "no wrap")
 
         assertEquals(SendConversationMessageResult.Rejected, result)
         assertEquals(0, repository.writes)
@@ -204,9 +204,9 @@ class ConversationUseCasesTest {
         val wrongIdThatLoadsAuthoritativeFact = RecordingConversationRepository(snapshot(), loadAnyId = true)
         val ids = object : IdGenerator { override fun nextId() = error("rejected sends must not allocate") }
 
-        assertEquals(SendConversationMessageResult.Rejected, SendConversationMessage(missing, ids)(ConversationMessageDestination(ConversationId("missing"), ConversationRevision(4)), "missing"))
-        assertEquals(SendConversationMessageResult.Rejected, SendConversationMessage(archived, ids)(ConversationMessageDestination(ConversationId("conversation-1"), ConversationRevision(4)), "archived"))
-        assertEquals(SendConversationMessageResult.Rejected, SendConversationMessage(wrongIdThatLoadsAuthoritativeFact, ids)(ConversationMessageDestination(ConversationId("wrong-id"), ConversationRevision(4)), "wrong"))
+        assertEquals(SendConversationMessageResult.Rejected, sendUseCase(missing, ids)(ConversationMessageDestination(ConversationId("missing"), ConversationRevision(4)), "missing"))
+        assertEquals(SendConversationMessageResult.Rejected, sendUseCase(archived, ids)(ConversationMessageDestination(ConversationId("conversation-1"), ConversationRevision(4)), "archived"))
+        assertEquals(SendConversationMessageResult.Rejected, sendUseCase(wrongIdThatLoadsAuthoritativeFact, ids)(ConversationMessageDestination(ConversationId("wrong-id"), ConversationRevision(4)), "wrong"))
         assertEquals(0, missing.writes + archived.writes + wrongIdThatLoadsAuthoritativeFact.writes)
     }
 
@@ -216,8 +216,44 @@ class ConversationUseCasesTest {
         val historic = ConversationMessageDestination(ConversationId("conversation-1"), ConversationRevision(3))
         val repository = RecordingConversationRepository(snapshot().copy(drafts = listOf(Draft(exact, "sent"), Draft(historic, "keep"))))
 
-        assertEquals(SendConversationMessageResult.Sent, SendConversationMessage(repository, object : IdGenerator { override fun nextId() = "message-1" })(exact, "sent"))
+        assertEquals(SendConversationMessageResult.Sent, sendUseCase(repository, object : IdGenerator { override fun nextId() = "message-1" })(exact, "sent"))
         assertEquals(listOf(Draft(historic, "keep")), repository.current.drafts)
+    }
+
+    @Test
+    fun sendDoesNotPersistWhenModelRouteIsMissing() = runBlocking {
+        val repository = RecordingConversationRepository(snapshot())
+
+        val result = sendUseCase(
+            repository,
+            object : IdGenerator { override fun nextId() = error("blocked send must not allocate") },
+            ConversationSendRouteStatus.MODEL_ROUTE_MISSING,
+        )(
+            ConversationMessageDestination(ConversationId("conversation-1"), ConversationRevision(4)),
+            "keep this as an unsent draft",
+        )
+
+        assertEquals(SendConversationMessageResult.MODEL_ROUTE_MISSING, result)
+        assertEquals(0, repository.writes)
+        assertEquals(emptyList<MessagePersistenceState>(), repository.current.messages)
+    }
+
+    @Test
+    fun sendDoesNotPersistWhenProviderRevisionChanged() = runBlocking {
+        val repository = RecordingConversationRepository(snapshot())
+
+        val result = sendUseCase(
+            repository,
+            object : IdGenerator { override fun nextId() = error("blocked send must not allocate") },
+            ConversationSendRouteStatus.MODEL_ROUTE_REVISION_MISMATCH,
+        )(
+            ConversationMessageDestination(ConversationId("conversation-1"), ConversationRevision(4)),
+            "do not send history to the new endpoint",
+        )
+
+        assertEquals(SendConversationMessageResult.MODEL_ROUTE_REVISION_MISMATCH, result)
+        assertEquals(0, repository.writes)
+        assertEquals(emptyList<MessagePersistenceState>(), repository.current.messages)
     }
 
     @Test
@@ -327,4 +363,14 @@ class ConversationUseCasesTest {
     )
 
     private fun persona() = Persona("Nova", "Blue", "Calm", "Exact", "Short")
+
+    private fun sendUseCase(
+        repository: ConversationRepository,
+        ids: IdGenerator,
+        status: ConversationSendRouteStatus = ConversationSendRouteStatus.READY,
+    ) = SendConversationMessage(
+        repository,
+        ids,
+        ConversationSendRouteGuard { _, _ -> status },
+    )
 }

@@ -29,7 +29,7 @@ class CreateConversation(
         val definition = agent.agent.persona.definition
         val greeting = definition?.firstMessage
             ?.takeIf(String::isNotBlank)
-            ?.let { AgentPromptBuilder.renderDialogueText(it, definition) }
+            ?.let { AgentPromptPlanner.renderDialogueText(it, definition) }
             .orEmpty()
         val initialRevision = if (greeting.isBlank()) 0L else 1L
         val conversation = Conversation(conversationId, agentId, ConversationRevision(initialRevision))

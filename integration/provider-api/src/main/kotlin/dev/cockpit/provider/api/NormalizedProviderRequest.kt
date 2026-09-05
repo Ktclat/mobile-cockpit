@@ -1,5 +1,7 @@
 package dev.cockpit.provider.api
 
+import dev.cockpit.domain.prompt.PromptPlan
+
 enum class ProviderMessageRole { SYSTEM, USER, ASSISTANT }
 
 data class ProviderMessage(
@@ -10,7 +12,7 @@ data class ProviderMessage(
 data class NormalizedProviderRequest(
     val invocationId: ProviderInvocationId,
     val profile: ProviderProfile,
-    val systemInstruction: String,
+    val promptPlan: PromptPlan,
     val messages: List<ProviderMessage>,
     val maxOutputTokens: Int = profile.maxOutputTokens,
 ) {

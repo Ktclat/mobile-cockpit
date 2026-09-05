@@ -4,13 +4,15 @@ import android.content.Context
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import dev.cockpit.application.AppendConversationAgentMessage
-import dev.cockpit.application.AgentPromptBuilder
+import dev.cockpit.application.AgentPromptPlanner
 import dev.cockpit.application.ArchiveConversation
 import dev.cockpit.application.CharacterCardJsonExporter
 import dev.cockpit.application.CreateAgent
 import dev.cockpit.application.CreateAgentCommand
 import dev.cockpit.application.CreateConversation
 import dev.cockpit.application.ConversationMutationCoordinator
+import dev.cockpit.application.ConversationSendRouteGuard
+import dev.cockpit.application.ConversationSendRouteStatus
 import dev.cockpit.application.RestoreConversation
 import dev.cockpit.application.SaveConversationDraft
 import dev.cockpit.application.SendConversationMessage
@@ -35,6 +37,8 @@ import dev.cockpit.domain.agent.Persona
 import dev.cockpit.domain.agent.editableDefinition
 import dev.cockpit.domain.conversation.ConversationMessageDestination
 import dev.cockpit.domain.ids.IdGenerator
+import dev.cockpit.domain.time.AppClock
+import dev.cockpit.domain.time.InstantValue
 import dev.cockpit.persistence.room.CockpitDatabase
 import dev.cockpit.persistence.room.RoomConversationRepository
 import dev.cockpit.persistence.room.RoomProviderConfigurationRepository
@@ -44,6 +48,7 @@ import dev.cockpit.persistence.room.migration.Migration3To4
 import dev.cockpit.persistence.room.migration.Migration4To5
 import dev.cockpit.persistence.room.migration.Migration5To6
 import dev.cockpit.persistence.api.AgentDraftPersistenceState
+import dev.cockpit.persistence.api.ConversationProviderRouteResolution
 import dev.cockpit.provider.ProviderAdapterRegistry
 import dev.cockpit.provider.api.ProviderAdapterResolver
 import dev.cockpit.provider.api.NormalizedProviderRequest
@@ -65,20 +70,17 @@ import kotlinx.coroutines.withContext
 import java.util.UUID
 
 class CockpitProcessComponent internal constructor(
-    private val responder: ConversationTextResponder?,
     databaseFactory: () -> CockpitDatabase,
     mutationScope: CoroutineScope,
     credentialVaultFactory: () -> CredentialVault = ::createEphemeralProviderCredentialVault,
     providerAdapterResolver: ProviderAdapterResolver = ProviderAdapterRegistry(),
 ) {
-    constructor(responder: ConversationTextResponder? = null) : this(
-        responder = responder,
+    constructor() : this(
         databaseFactory = { CockpitDatabase.open("cockpit-local.db") },
         mutationScope = newConversationMutationScope(),
     )
 
-    constructor(context: Context, responder: ConversationTextResponder? = null) : this(
-        responder = responder,
+    constructor(context: Context) : this(
         databaseFactory = {
             Room.databaseBuilder(
                 context.applicationContext,
@@ -104,11 +106,14 @@ class CockpitProcessComponent internal constructor(
     private val repository by lazy { RoomConversationRepository(database) }
     private val providerRepository by lazy { RoomProviderConfigurationRepository(database) }
     private val credentialVault by lazy(credentialVaultFactory)
-    private val providerInvocationGate by lazy {
-        ProviderInvocationGate(credentialVault, providerAdapterResolver)
-    }
     private val ids = object : IdGenerator {
         override fun nextId(): String = UUID.randomUUID().toString()
+    }
+    private val clock = object : AppClock {
+        override fun now(): InstantValue = InstantValue(System.currentTimeMillis())
+    }
+    private val providerInvocationGate by lazy {
+        ProviderInvocationGate(credentialVault, providerAdapterResolver, clock, ids)
     }
     private val projector by lazy { ConversationProjector(repository) }
     private val createAgentUseCase by lazy { CreateAgent(repository, ids) }
@@ -117,7 +122,20 @@ class CockpitProcessComponent internal constructor(
     private val archiveConversationUseCase by lazy { ArchiveConversation(repository) }
     private val restoreConversationUseCase by lazy { RestoreConversation(repository) }
     private val saveDraftUseCase by lazy { SaveConversationDraft(repository) }
-    private val sendMessageUseCase by lazy { SendConversationMessage(repository, ids) }
+    private val sendMessageUseCase by lazy {
+        SendConversationMessage(
+            repository,
+            ids,
+            ConversationSendRouteGuard { conversationId, agentId ->
+                when (providerRepository.resolveConversationRoute(conversationId, agentId)) {
+                    is ConversationProviderRouteResolution.Ready -> ConversationSendRouteStatus.READY
+                    is ConversationProviderRouteResolution.RevisionMismatch ->
+                        ConversationSendRouteStatus.MODEL_ROUTE_REVISION_MISMATCH
+                    ConversationProviderRouteResolution.Missing -> ConversationSendRouteStatus.MODEL_ROUTE_MISSING
+                }
+            },
+        )
+    }
     private val appendAgentMessageUseCase by lazy { AppendConversationAgentMessage(repository, ids) }
     private val conversationMutations = ConversationMutationCoordinator(mutationScope)
     private val providerConversationRuntime by lazy {
@@ -125,7 +143,6 @@ class CockpitProcessComponent internal constructor(
             conversations = repository,
             providers = providerRepository,
             invocationGate = providerInvocationGate,
-            responder = responder,
             appendAgentMessage = appendAgentMessageUseCase,
             mutations = conversationMutations,
             processScope = mutationScope,
@@ -295,14 +312,14 @@ class CockpitProcessComponent internal constructor(
             var failure: String? = null
             var completed = false
             try {
-                val prompt = AgentPromptBuilder.build(
+                val prompt = AgentPromptPlanner.build(
                     persona = input.toPersona(),
                     conversationText = messages.map { it.text },
                 )
                 val request = NormalizedProviderRequest(
                     invocationId = invocationId,
                     profile = profile,
-                    systemInstruction = prompt.systemInstruction,
+                    promptPlan = prompt,
                     messages = messages.map {
                         ProviderMessage(
                             role = when (it.role) {
@@ -365,13 +382,24 @@ class CockpitProcessComponent internal constructor(
             }
 
         override suspend fun sendMessage(destination: ConversationMessageDestination, text: String): Boolean {
-            val accepted = conversationMutations.submit(destination.conversationId) {
-                sendMessageUseCase(destination, text) == SendConversationMessageResult.Sent
+            val result = conversationMutations.submit(destination.conversationId) {
+                if (providerConversationRuntime.hasActive(destination.conversationId)) {
+                    SendConversationMessageResult.Rejected
+                } else {
+                    sendMessageUseCase(destination, text).also { result ->
+                        if (result == SendConversationMessageResult.Sent) {
+                            providerConversationRuntime.startAfterAccepted(destination)
+                        }
+                    }
+                }
             }
-            if (!accepted) return false
-            providerConversationRuntime.startAfterAccepted(destination, text)
-            return true
+            return result == SendConversationMessageResult.Sent
         }
+
+        override suspend fun migrateProviderRoute(id: ConversationId): Boolean =
+            conversationMutations.submit(id) {
+                providerRepository.migrateConversationRoute(id) is ConversationProviderRouteResolution.Ready
+            }
 
         override suspend fun cancelReply(id: ConversationId): Boolean =
             providerConversationRuntime.cancel(id)
@@ -434,7 +462,7 @@ private fun AgentProfileInput.toPersona(): Persona {
         voice = definition.personality.ifBlank { "Clear" },
         behavioralTendency = definition.personality.ifBlank { "Helpful" },
         promptStyle = definition.systemPrompt.ifBlank {
-            AgentPromptBuilder.defaultSystemPrompt(definition.mode)
+            AgentPromptPlanner.defaultSystemPrompt(definition.mode)
         },
         definition = definition,
     )

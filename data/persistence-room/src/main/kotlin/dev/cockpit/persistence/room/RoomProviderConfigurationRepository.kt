@@ -6,6 +6,7 @@ import dev.cockpit.domain.AgentId
 import dev.cockpit.domain.ConversationId
 import dev.cockpit.persistence.api.AgentProviderBindingPersistenceState
 import dev.cockpit.persistence.api.ConversationProviderRoutePersistenceState
+import dev.cockpit.persistence.api.ConversationProviderRouteResolution
 import dev.cockpit.persistence.api.ProviderConfigurationRepository
 import dev.cockpit.persistence.api.ProviderConfigurationSnapshot
 import dev.cockpit.persistence.api.ProviderModelOptionPersistenceState
@@ -45,24 +46,59 @@ class RoomProviderConfigurationRepository(
     override suspend fun profileForAgent(agentId: AgentId): ProviderProfilePersistenceState? =
         database.withReadTransaction { resolveAgentRoute(agentId)?.resolvedProfile() }
 
-    override suspend fun profileForConversation(
+    override suspend fun resolveConversationRoute(
         conversationId: ConversationId,
         agentId: AgentId,
-    ): ProviderProfilePersistenceState? = database.withWriteTransaction {
+    ): ConversationProviderRouteResolution = database.withWriteTransaction {
         val existing = database.conversationProviderRouteDao().forConversation(conversationId.value)
-        if (existing != null) return@withWriteTransaction existing.resolvedProfile()
+        if (existing != null) return@withWriteTransaction existing.resolveLockedRoute()
 
-        val resolved = resolveAgentRoute(agentId) ?: return@withWriteTransaction null
-        val profile = resolved.resolvedProfile() ?: return@withWriteTransaction null
-        database.conversationProviderRouteDao().upsert(
-            ConversationProviderRouteEntity(
-                conversationId = conversationId.value,
-                providerProfileId = resolved.connectionId,
-                modelId = resolved.modelId,
-                requestRevision = profile.revision,
-            ),
+        val existingMessages = database.messageDao().forConversation(conversationId.value)
+        if (!existingMessages.isSafeForInitialRouteBinding()) {
+            return@withWriteTransaction ConversationProviderRouteResolution.Missing
+        }
+
+        val resolved = resolveAgentRoute(agentId)
+            ?: return@withWriteTransaction ConversationProviderRouteResolution.Missing
+        val profile = resolved.resolvedProfile()
+            ?: return@withWriteTransaction ConversationProviderRouteResolution.Missing
+        val route = ConversationProviderRouteEntity(
+            conversationId = conversationId.value,
+            providerProfileId = resolved.connectionId,
+            modelId = resolved.modelId,
+            requestRevision = profile.revision,
         )
-        profile
+        database.conversationProviderRouteDao().upsert(route)
+        ConversationProviderRouteResolution.Ready(profile, route.toState())
+    }
+
+    override suspend fun migrateConversationRoute(
+        conversationId: ConversationId,
+    ): ConversationProviderRouteResolution = database.withWriteTransaction {
+        val existing = database.conversationProviderRouteDao().forConversation(conversationId.value)
+        if (existing == null) {
+            val conversation = database.conversationDao().find(conversationId.value)
+                ?: return@withWriteTransaction ConversationProviderRouteResolution.Missing
+            val route = resolveAgentRoute(AgentId(conversation.agentId))
+                ?: return@withWriteTransaction ConversationProviderRouteResolution.Missing
+            val resolved = route.resolvedProfile()
+                ?: return@withWriteTransaction ConversationProviderRouteResolution.Missing
+            val bound = ConversationProviderRouteEntity(
+                conversationId = conversationId.value,
+                providerProfileId = route.connectionId,
+                modelId = route.modelId,
+                requestRevision = resolved.revision,
+            )
+            database.conversationProviderRouteDao().upsert(bound)
+            return@withWriteTransaction ConversationProviderRouteResolution.Ready(resolved, bound.toState())
+        }
+        val resolved = ProviderModelRoutePersistenceState(
+            existing.providerProfileId,
+            existing.modelId,
+        ).resolvedProfile() ?: return@withWriteTransaction ConversationProviderRouteResolution.Missing
+        val migrated = existing.copy(requestRevision = resolved.revision)
+        database.conversationProviderRouteDao().upsert(migrated)
+        ConversationProviderRouteResolution.Ready(resolved, migrated.toState())
     }
 
     override suspend fun saveProfile(profile: ProviderProfilePersistenceState) =
@@ -155,8 +191,35 @@ class RoomProviderConfigurationRepository(
         return connection.toState().copy(model = model.remoteModelId, preferredModelId = model.id)
     }
 
-    private suspend fun ConversationProviderRouteEntity.resolvedProfile(): ProviderProfilePersistenceState? =
-        ProviderModelRoutePersistenceState(providerProfileId, modelId).resolvedProfile()
+    private suspend fun ConversationProviderRouteEntity.resolveLockedRoute(): ConversationProviderRouteResolution {
+        val profile = database.providerProfileDao().find(providerProfileId)
+            ?: return ConversationProviderRouteResolution.Missing
+        if (profile.revision != requestRevision) {
+            return ConversationProviderRouteResolution.RevisionMismatch(
+                route = toState(),
+                currentProfileRevision = profile.revision,
+            )
+        }
+        val resolved = ProviderModelRoutePersistenceState(providerProfileId, modelId).resolvedProfile()
+            ?: return ConversationProviderRouteResolution.Missing
+        return ConversationProviderRouteResolution.Ready(resolved, toState())
+    }
+
+    private fun ConversationProviderRouteEntity.toState() = ConversationProviderRoutePersistenceState(
+        conversationId = ConversationId(conversationId),
+        providerProfileId = providerProfileId,
+        modelId = modelId,
+        requestRevision = requestRevision,
+    )
+}
+
+private fun List<MessageEntity>.isSafeForInitialRouteBinding(): Boolean {
+    if (isEmpty()) return true
+    val message = singleOrNull() ?: return false
+    return message.ordinal == 1L &&
+        message.role == "AGENT" &&
+        message.source == "RUNTIME" &&
+        message.status == "DELIVERED"
 }
 
 private fun ProviderProfilePersistenceState.toEntity() = ProviderProfileEntity(

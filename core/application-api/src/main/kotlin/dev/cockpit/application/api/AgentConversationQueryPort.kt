@@ -101,6 +101,7 @@ interface ConversationApplicationPort {
     suspend fun restoreConversation(id: ConversationId): Boolean
     suspend fun saveDraft(destination: ConversationMessageDestination, text: String): Boolean
     suspend fun sendMessage(destination: ConversationMessageDestination, text: String): Boolean
+    suspend fun migrateProviderRoute(id: ConversationId): Boolean = false
     suspend fun cancelReply(id: ConversationId): Boolean = false
     suspend fun retryReply(id: ConversationId): Boolean = false
 }

@@ -91,6 +91,13 @@ class SchemaV1MigrationTest {
                     revision = ConversationRevision(41L),
                 ),
                 archiveState = ArchiveState.ARCHIVED,
+                personaSnapshot = Persona(
+                    identity = "Nova",
+                    presentation = "Midnight blue",
+                    voice = "Calm",
+                    behavioralTendency = "Methodical",
+                    promptStyle = "Concise",
+                ),
             ),
             messages = listOf(
                 MessagePersistenceState(
@@ -189,7 +196,7 @@ class SchemaV1MigrationTest {
     }
 
     @Test
-    fun secondSaveReplacesTheWholeConversationSnapshot() {
+    fun secondConversationSaveDoesNotOverwriteAuthoritativeAgent() {
         runBlocking {
         database = CockpitDatabase.open(temporaryDirectory.resolve("repeat.db").toString())
         val repository = RoomConversationRepository(checkNotNull(database))
@@ -208,7 +215,10 @@ class SchemaV1MigrationTest {
         repository.save(first)
         repository.save(second)
 
-        assertEquals(second, requireNotNull(repository.load(ConversationId("conversation-repeat"))))
+        assertEquals(
+            second.copy(agent = first.agent),
+            requireNotNull(repository.load(ConversationId("conversation-repeat"))),
+        )
         }
     }
 
@@ -272,7 +282,7 @@ class SchemaV1MigrationTest {
         database = CockpitDatabase.open(temporaryDirectory.resolve("agent-detail-observe.db").toString())
         val repository = RoomConversationRepository(checkNotNull(database))
         val initialAgent = AgentPersistenceState(Agent(AgentId("agent-detail"), Persona("Detail", "Blue", "Calm", "Exact", "Short"), AgentCapabilities("Local")), "persona-detail", 6, ArchiveState.ACTIVE)
-        val initialSnapshot = ConversationSnapshot(PersonaPersistenceState("persona-detail", initialAgent.agent.persona), initialAgent, ConversationPersistenceState(Conversation(ConversationId("detail-conversation"), initialAgent.agent.id, ConversationRevision(2)), ArchiveState.ACTIVE), listOf(MessagePersistenceState("initial-message", Message(ConversationId("detail-conversation"), "initial"), 1, MessageRole.AGENT, MessageSource.RUNTIME, MessageStatus.DELIVERED)), listOf(Draft(ConversationMessageDestination(ConversationId("detail-conversation"), ConversationRevision(2)), "initial draft")))
+        val initialSnapshot = ConversationSnapshot(PersonaPersistenceState("persona-detail", initialAgent.agent.persona), initialAgent, ConversationPersistenceState(Conversation(ConversationId("detail-conversation"), initialAgent.agent.id, ConversationRevision(2)), ArchiveState.ACTIVE, personaSnapshot = initialAgent.agent.persona), listOf(MessagePersistenceState("initial-message", Message(ConversationId("detail-conversation"), "initial"), 1, MessageRole.AGENT, MessageSource.RUNTIME, MessageStatus.DELIVERED)), listOf(Draft(ConversationMessageDestination(ConversationId("detail-conversation"), ConversationRevision(2)), "initial draft")))
         val replacementAgent = initialAgent.copy(revision = 7, archiveState = ArchiveState.ARCHIVED)
         val replacement = initialSnapshot.copy(agent = replacementAgent, conversation = ConversationPersistenceState(Conversation(ConversationId("detail-conversation"), replacementAgent.agent.id, ConversationRevision(3)), ArchiveState.ARCHIVED), messages = listOf(MessagePersistenceState("replacement-message", Message(ConversationId("detail-conversation"), "replacement"), 4, MessageRole.USER, MessageSource.USER, MessageStatus.ACCEPTED)), drafts = listOf(Draft(ConversationMessageDestination(ConversationId("detail-conversation"), ConversationRevision(3)), "replacement draft")))
         repository.save(initialSnapshot)
@@ -281,7 +291,19 @@ class SchemaV1MigrationTest {
         try {
             assertEquals(AgentDetailReadFact(AgentReadFact(initialSnapshot.persona, initialSnapshot.agent), listOf(initialSnapshot)), emissions.receive())
             repository.save(replacement)
-            assertEquals(AgentDetailReadFact(AgentReadFact(replacement.persona, replacement.agent), listOf(replacement)), emissions.receive())
+            val persistedReplacement = replacement.copy(
+                agent = initialAgent,
+                conversation = replacement.conversation.copy(
+                    personaSnapshot = initialAgent.agent.persona,
+                ),
+            )
+            assertEquals(
+                AgentDetailReadFact(
+                    AgentReadFact(initialSnapshot.persona, initialAgent),
+                    listOf(persistedReplacement),
+                ),
+                emissions.receive(),
+            )
             assertEquals(null, withTimeoutOrNull(250) { emissions.receive() })
         } finally {
             job.cancelAndJoin()
@@ -295,7 +317,11 @@ class SchemaV1MigrationTest {
     ) = ConversationSnapshot(
         PersonaPersistenceState("persona-repeat", Persona("Repeat", "Blue", "Calm", "Exact", "Short")),
         AgentPersistenceState(Agent(AgentId("agent-repeat"), Persona("Repeat", "Blue", "Calm", "Exact", "Short"), AgentCapabilities("summary")), "persona-repeat", 17L, archiveState),
-        ConversationPersistenceState(Conversation(ConversationId("conversation-repeat"), AgentId("agent-repeat"), ConversationRevision(9L)), archiveState),
+        ConversationPersistenceState(
+            Conversation(ConversationId("conversation-repeat"), AgentId("agent-repeat"), ConversationRevision(9L)),
+            archiveState,
+            personaSnapshot = Persona("Repeat", "Blue", "Calm", "Exact", "Short"),
+        ),
         messages,
         drafts,
     )

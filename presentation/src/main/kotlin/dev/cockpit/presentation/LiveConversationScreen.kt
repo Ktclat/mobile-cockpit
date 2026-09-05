@@ -54,6 +54,7 @@ import dev.cockpit.application.api.ConversationApplicationPort
 import dev.cockpit.domain.ConversationId
 import dev.cockpit.projection.model.ArchiveProjectionState
 import dev.cockpit.projection.model.ConversationProjection
+import dev.cockpit.projection.model.ConversationProviderRouteState
 import dev.cockpit.projection.model.ConversationSummaryProjection
 import dev.cockpit.projection.model.MessageProjection
 import dev.cockpit.projection.model.MessageRoleProjection
@@ -101,6 +102,10 @@ internal fun LiveConversation(
         scope.launch { actions.retryReply(current.id) }
         Unit
     }
+    val migrateProviderRoute = {
+        scope.launch { actions.migrateProviderRoute(current.id) }
+        Unit
+    }
 
     if (current.archiveState == ArchiveProjectionState.ACTIVE) {
         ConversationComposerHost(
@@ -127,6 +132,7 @@ internal fun LiveConversation(
                 onRestore = restore,
                 onCancelReply = cancelReply,
                 onRetryReply = retryReply,
+                onMigrateProviderRoute = migrateProviderRoute,
                 onBack = composer.onNavigateUp,
                 composer = composer,
             )
@@ -150,6 +156,7 @@ internal fun LiveConversation(
             onRestore = restore,
             onCancelReply = cancelReply,
             onRetryReply = retryReply,
+            onMigrateProviderRoute = migrateProviderRoute,
             onBack = { navigation.navigateUp() },
             composer = null,
         )
@@ -170,6 +177,7 @@ private fun ConversationFrame(
     onRestore: () -> Unit,
     onCancelReply: () -> Unit,
     onRetryReply: () -> Unit,
+    onMigrateProviderRoute: () -> Unit,
     onBack: () -> Unit,
     composer: ConversationComposerUiState?,
 ) {
@@ -211,6 +219,7 @@ private fun ConversationFrame(
             onConfigureProvider = onConfigureProvider,
             onCancelReply = onCancelReply,
             onRetryReply = onRetryReply,
+            onMigrateProviderRoute = onMigrateProviderRoute,
             modifier = Modifier.weight(1f),
         )
         if (active && composer != null) {
@@ -327,6 +336,7 @@ private fun ConversationTimeline(
     onConfigureProvider: () -> Unit,
     onCancelReply: () -> Unit,
     onRetryReply: () -> Unit,
+    onMigrateProviderRoute: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val translator = LocalCockpitTranslator.current
@@ -352,7 +362,11 @@ private fun ConversationTimeline(
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        if (streamingReply?.inProgress == true || providerError != null || provider == null) {
+        if (
+            streamingReply?.inProgress == true ||
+            providerError != null ||
+            projection.providerRouteState != ConversationProviderRouteState.READY
+        ) {
             item("provider-status") {
                 when {
                     streamingReply?.inProgress == true -> InfoBanner(
@@ -361,6 +375,22 @@ private fun ConversationTimeline(
                         actionLabel = "Stop",
                         onAction = onCancelReply,
                     )
+                    projection.providerRouteState == ConversationProviderRouteState.REVISION_MISMATCH ->
+                        InfoBanner(
+                            title = "API configuration changed",
+                            body = "This conversation's bound API configuration has changed.",
+                            tone = StatusTone.Warning,
+                            actionLabel = "Migrate this conversation to the current configuration",
+                            onAction = onMigrateProviderRoute,
+                        )
+                    projection.providerRouteState == ConversationProviderRouteState.MISSING && provider != null ->
+                        InfoBanner(
+                            title = "API configuration not bound",
+                            body = "This conversation has existing history and must be migrated explicitly.",
+                            tone = StatusTone.Warning,
+                            actionLabel = "Migrate this conversation to the current configuration",
+                            onAction = onMigrateProviderRoute,
+                        )
                     providerError != null -> InfoBanner(
                         title = if (providerError.code == "CANCELLED") {
                             "Response stopped"

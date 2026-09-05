@@ -36,6 +36,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import dev.cockpit.domain.conversation.ConversationMessageDestination
 import dev.cockpit.projection.model.ConversationProjection
+import dev.cockpit.projection.model.ConversationProviderRouteState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
@@ -121,7 +122,8 @@ internal fun ConversationComposerHost(
     val enabled = !invalid && !inFlight && projection.streamingReply?.inProgress != true
     val saveEnabled = enabled && text.isNotEmpty()
     val sendEnabled =
-        enabled && !stale && completed == null && text.isNotBlank()
+        enabled && !stale && completed == null && text.isNotBlank() &&
+            projection.providerRouteState == ConversationProviderRouteState.READY
 
     val updateText: (String) -> Unit = { updated ->
         text = updated
@@ -332,9 +334,7 @@ internal fun ConversationComposerBar(
                 ) {
                     Icon(
                         imageVector = Icons.Rounded.Done,
-                        contentDescription = translator.text(
-                            if (state.inFlight) "Saving…" else "Save draft",
-                        ),
+                        contentDescription = translator.text("Save draft"),
                         modifier = Modifier.size(22.dp),
                     )
                 }
@@ -358,16 +358,16 @@ internal fun ConversationComposerBar(
                     "Draft could not be saved. Text is preserved.",
                     danger = true,
                 )
+                state.stale -> ComposerNotice(
+                    "Draft destination is stale. Send is disabled.",
+                    danger = true,
+                )
                 state.failedSend -> ComposerNotice(
                     "Message could not be sent. Text is preserved.",
                     danger = true,
                 )
                 state.failedNavigation -> ComposerNotice(
                     "Navigation could not complete.",
-                    danger = true,
-                )
-                state.stale -> ComposerNotice(
-                    "Draft destination is stale. Send is disabled.",
                     danger = true,
                 )
             }

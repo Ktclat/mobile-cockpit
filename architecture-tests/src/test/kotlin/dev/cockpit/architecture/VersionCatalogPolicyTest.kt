@@ -783,7 +783,7 @@ class VersionCatalogPolicyTest {
             "kotlin" to "2.4.10",
             "composeCompiler" to "2.4.10",
             "minSdk" to "28",
-            "compileSdk" to "36",
+            "compileSdk" to "37",
             "targetSdk" to "36",
             "composeBom" to "2026.06.00",
             "junit" to "5.14.3",

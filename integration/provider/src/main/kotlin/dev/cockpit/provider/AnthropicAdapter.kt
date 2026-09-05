@@ -1,6 +1,7 @@
 package dev.cockpit.provider
 
 import dev.cockpit.domain.bytes.ImmutableBytes
+import dev.cockpit.domain.prompt.PromptMessageRole
 import dev.cockpit.provider.api.*
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
@@ -256,12 +257,33 @@ class AnthropicAdapter(
         put("model", request.profile.model)
         put("stream", true)
         put("max_tokens", request.maxOutputTokens)
-        if (request.systemInstruction.isNotBlank()) put("system", request.systemInstruction)
+        request.promptPlan.systemInstructions.joinToString("\n\n")
+            .takeIf(String::isNotBlank)
+            ?.let { put("system", it) }
         put("messages", buildJsonArray {
-            request.messages.filter { it.role != ProviderMessageRole.SYSTEM }.forEach { message ->
+            request.promptPlan.fewShotMessages.forEach { message ->
                 add(buildJsonObject {
-                    put("role", if (message.role == ProviderMessageRole.USER) "user" else "assistant")
+                    put("role", if (message.role == PromptMessageRole.USER) "user" else "assistant")
                     put("content", message.text)
+                })
+            }
+            request.messages.forEach { message ->
+                add(buildJsonObject {
+                    put("role", if (message.role == ProviderMessageRole.ASSISTANT) "assistant" else "user")
+                    put(
+                        "content",
+                        if (message.role == ProviderMessageRole.SYSTEM) {
+                            "<system_message>\n${message.text}\n</system_message>"
+                        } else {
+                            message.text
+                        },
+                    )
+                })
+            }
+            request.promptPlan.postHistoryInstructions.forEach { instruction ->
+                add(buildJsonObject {
+                    put("role", "user")
+                    put("content", "<post_history_instruction>\n$instruction\n</post_history_instruction>")
                 })
             }
         })

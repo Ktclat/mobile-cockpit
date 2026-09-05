@@ -33,6 +33,7 @@ data class AgentDetailProjection(
     val importSource: AgentImportSource? = null,
 )
 data class ConversationSummaryProjection(val id: ConversationId, val revision: ConversationRevision, val archiveState: ArchiveProjectionState)
+enum class ConversationProviderRouteState { READY, MISSING, REVISION_MISMATCH }
 data class ConversationProjection(
     val id: ConversationId,
     val agentId: AgentId,
@@ -42,6 +43,7 @@ data class ConversationProjection(
     val drafts: List<DraftProjection>,
     val timeline: List<TimelineItemProjection>,
     val provider: BoundProviderProjection? = null,
+    val providerRouteState: ConversationProviderRouteState = ConversationProviderRouteState.MISSING,
     val streamingReply: StreamingReplyProjection? = null,
     val providerError: ProviderReplyErrorProjection? = null,
 )
