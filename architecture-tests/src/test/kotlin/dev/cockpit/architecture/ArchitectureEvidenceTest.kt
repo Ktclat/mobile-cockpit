@@ -771,7 +771,7 @@ class ArchitectureEvidenceTest {
                   - name: Set up Android SDK
                     uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699
                   - name: Install Android SDK packages
-                    run: sdkmanager "platforms;android-37" "build-tools;36.0.0"
+                    run: sdkmanager --install "platforms;android-37" "build-tools;36.0.0" --channel=3
                   - name: Verify foundation
                     run: ./gradlew test verifyArchitecture :app:assembleDebug lint
         """.trimIndent() + "\n"
