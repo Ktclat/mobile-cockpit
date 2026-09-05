@@ -5,7 +5,6 @@ import dev.cockpit.domain.conversation.ConversationMessageDestination
 import dev.cockpit.domain.conversation.Message
 import dev.cockpit.domain.ids.IdGenerator
 import dev.cockpit.persistence.api.ArchiveState
-import dev.cockpit.persistence.api.ConversationPersistenceState
 import dev.cockpit.persistence.api.ConversationRepository
 import dev.cockpit.persistence.api.MessagePersistenceState
 import dev.cockpit.persistence.api.MessageRole
@@ -21,7 +20,7 @@ class SendConversationMessage(private val repository: ConversationRepository, pr
         val ordinal = snapshot.messages.maxOfOrNull { it.ordinal }?.let { if (it == Long.MAX_VALUE) return SendConversationMessageResult.Rejected else it + 1 } ?: 0L
         val message = Message(destination.conversationId, text)
         val accepted = try { snapshot.conversation.conversation.accept(message, destination) } catch (_: ConversationDestinationRejected) { return SendConversationMessageResult.Rejected }
-        repository.save(snapshot.copy(conversation = ConversationPersistenceState(accepted, snapshot.conversation.archiveState), messages = snapshot.messages + MessagePersistenceState(ids.nextId(), message, ordinal, MessageRole.USER, MessageSource.USER, MessageStatus.ACCEPTED), drafts = snapshot.drafts.filterNot { it.destination == destination }))
+        repository.save(snapshot.copy(conversation = snapshot.conversation.copy(conversation = accepted), messages = snapshot.messages + MessagePersistenceState(ids.nextId(), message, ordinal, MessageRole.USER, MessageSource.USER, MessageStatus.ACCEPTED), drafts = snapshot.drafts.filterNot { it.destination == destination }))
         return SendConversationMessageResult.Sent
     }
 }

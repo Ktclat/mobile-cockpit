@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <exclude domain="sharedpref" path="cockpit-provider-vault-v1.xml" />
+    <exclude domain="database" path="cockpit-local.db" />
+    <exclude domain="database" path="cockpit-local.db-shm" />
+    <exclude domain="database" path="cockpit-local.db-wal" />
+</full-backup-content>

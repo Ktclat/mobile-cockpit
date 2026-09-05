@@ -5,7 +5,6 @@ import dev.cockpit.domain.conversation.ConversationMessageDestination
 import dev.cockpit.domain.conversation.Message
 import dev.cockpit.domain.ids.IdGenerator
 import dev.cockpit.persistence.api.ArchiveState
-import dev.cockpit.persistence.api.ConversationPersistenceState
 import dev.cockpit.persistence.api.ConversationRepository
 import dev.cockpit.persistence.api.MessagePersistenceState
 import dev.cockpit.persistence.api.MessageRole
@@ -17,7 +16,12 @@ class AppendConversationAgentMessage(
     private val repository: ConversationRepository,
     private val ids: IdGenerator,
 ) {
-    suspend operator fun invoke(acceptedUserDestination: ConversationMessageDestination, text: String): Boolean {
+    suspend operator fun invoke(
+        acceptedUserDestination: ConversationMessageDestination,
+        text: String,
+        source: MessageSource = MessageSource.DEBUG,
+    ): Boolean {
+        if (source == MessageSource.USER) return false
         val snapshot = repository.load(acceptedUserDestination.conversationId) ?: return false
         if (snapshot.conversation.archiveState != ArchiveState.ACTIVE) return false
         val acceptedRevision = acceptedUserDestination.expectedConversationRevision.value
@@ -36,13 +40,13 @@ class AppendConversationAgentMessage(
         } ?: 0L
         repository.save(
             snapshot.copy(
-                conversation = ConversationPersistenceState(accepted, snapshot.conversation.archiveState),
+                conversation = snapshot.conversation.copy(conversation = accepted),
                 messages = snapshot.messages + MessagePersistenceState(
                     id = ids.nextId(),
                     message = message,
                     ordinal = ordinal,
                     role = MessageRole.AGENT,
-                    source = MessageSource.DEBUG,
+                    source = source,
                     status = MessageStatus.DELIVERED,
                 ),
             ),

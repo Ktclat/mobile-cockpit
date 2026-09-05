@@ -6,4 +6,5 @@ data class Persona(
     val voice: String,
     val behavioralTendency: String,
     val promptStyle: String,
+    val definition: AgentDefinition? = null,
 )

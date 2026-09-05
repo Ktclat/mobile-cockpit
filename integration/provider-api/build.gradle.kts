@@ -1,7 +1,12 @@
 plugins {
-    `java-library`
+    alias(libs.plugins.kotlin.jvm)
+}
+
+kotlin {
+    jvmToolchain(17)
 }
 
 dependencies {
-    implementation(project(":core:domain"))
+    api(project(":core:domain"))
+    implementation(libs.coroutines.core)
 }

@@ -12,6 +12,7 @@ dependencies {
     api(project(":core:domain"))
     implementation(libs.room.runtime)
     implementation(libs.sqlite.bundled)
+    implementation(libs.kotlinx.serialization.json)
     ksp(libs.room.compiler)
 
     testImplementation(libs.junit.jupiter)

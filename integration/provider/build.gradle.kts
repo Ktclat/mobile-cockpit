@@ -1,7 +1,14 @@
 plugins {
-    `java-library`
+    alias(libs.plugins.kotlin.jvm)
+}
+
+kotlin {
+    jvmToolchain(17)
 }
 
 dependencies {
-    implementation(project(":integration:provider-api"))
+    api(project(":integration:provider-api"))
+    implementation(libs.coroutines.core)
+    implementation(libs.okhttp)
+    implementation(libs.kotlinx.serialization.json)
 }

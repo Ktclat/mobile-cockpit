@@ -3,6 +3,7 @@ package dev.cockpit.projection
 import dev.cockpit.domain.AgentId
 import dev.cockpit.domain.ConversationId
 import dev.cockpit.domain.conversation.ConversationMessageDestination
+import dev.cockpit.domain.agent.editableDefinition
 import dev.cockpit.persistence.api.AgentConversationReadRepository
 import dev.cockpit.persistence.api.ArchiveState
 import dev.cockpit.persistence.api.ConversationSnapshot
@@ -23,13 +24,31 @@ import kotlinx.coroutines.flow.map
 
 class ConversationProjector(private val facts: AgentConversationReadRepository) {
     fun home(): Flow<HomeProjection> = facts.observeAgentFacts().map { agents ->
-        HomeProjection(agents.filter { it.agent.archiveState == ArchiveState.ACTIVE }.map { fact -> AgentSummaryProjection(fact.agent.agent.id, fact.agent.agent.persona.identity, fact.agent.revision) })
+        HomeProjection(agents.filter { it.agent.archiveState == ArchiveState.ACTIVE }.map { fact ->
+            val definition = fact.agent.agent.persona.editableDefinition()
+            AgentSummaryProjection(
+                id = fact.agent.agent.id,
+                name = definition.name,
+                revision = fact.agent.revision,
+                summary = definition.summary,
+                avatarRef = definition.avatarRef,
+                mode = definition.mode,
+            )
+        })
     }
 
     fun agent(id: AgentId): Flow<AgentDetailProjection> = facts.observeAgentDetail(id).map { detail ->
         val authoritative = requireNotNull(detail) { "Agent not found: ${id.value}" }.agent
         val snapshots = detail.conversations
-        AgentDetailProjection(authoritative.agent.agent.id, authoritative.agent.agent.persona.identity, authoritative.agent.revision, authoritative.agent.archiveState.toProjection(), snapshots.map(::conversationSummary))
+        AgentDetailProjection(
+            id = authoritative.agent.agent.id,
+            name = authoritative.agent.agent.persona.identity,
+            revision = authoritative.agent.revision,
+            archiveState = authoritative.agent.archiveState.toProjection(),
+            conversations = snapshots.map(::conversationSummary),
+            definition = authoritative.agent.agent.persona.editableDefinition(),
+            importSource = authoritative.agent.importSource,
+        )
     }
 
     fun conversation(id: ConversationId): Flow<ConversationProjection> = facts.observeConversation(id).map { snapshot ->

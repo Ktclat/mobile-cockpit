@@ -9,18 +9,28 @@
 .cxx/
 .externalNativeBuild/
 captures/
+/artifacts-*.png
+/artifacts-*.xml
 *.apk
 *.aab
 
 # Android and IDE-local configuration
 local.properties
 .idea/
+.vscode/
+.fleet/
 *.iml
+Thumbs.db
+.DS_Store
 
 # Signing and local secrets
 *.jks
 *.keystore
 *.p12
 *.pem
+*.key
+keystore.properties
+secrets.properties
+google-services.json
 .env
 .env.*

@@ -1,8 +1,7 @@
-name: Android foundation
+name: Android verification
 
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -20,6 +19,6 @@ jobs:
           cache: gradle
           check-latest: false
       - name: Install Android SDK packages
-        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+        run: sdkmanager "platforms;android-37" "build-tools;36.0.0"
       - name: Verify foundation
         run: ./gradlew test verifyArchitecture :app:assembleDebug lint

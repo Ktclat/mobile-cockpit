@@ -1,5 +1,9 @@
 plugins {
-    `java-library`
+    alias(libs.plugins.kotlin.jvm)
+}
+
+kotlin {
+    jvmToolchain(17)
 }
 
 dependencies {
@@ -13,4 +17,5 @@ dependencies {
     implementation(project(":integration:execution-api"))
     implementation(project(":data:persistence-api"))
     implementation(project(":platform:background-api"))
+    implementation(libs.coroutines.core)
 }

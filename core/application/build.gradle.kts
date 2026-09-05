@@ -15,6 +15,7 @@ dependencies {
     api(project(":data:persistence-api"))
     api(project(":data:projection-models"))
     implementation(libs.coroutines.core)
+    implementation(libs.kotlinx.serialization.json)
 
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly(libs.junit.platform.launcher)
